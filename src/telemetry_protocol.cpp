@@ -238,69 +238,93 @@ void TelemetryClient::ingestLocked(const TelemetryHeader& h, const TelemetryPayl
     S.last_seq = h.seq;
     S.good_frames++;
 }
-
 void TelemetryClient::threadMain(const std::string& port) {
-    while (run_.load()) {
+    auto reopen_and_settle = [&](bool first_time) {
         {
             std::lock_guard<std::mutex> lk(serial_mtx_);
-            if (serial_.open(port, 115200)) break;
+            serial_.close();
         }
+
+        // On some platforms/USB CDC, a short delay helps avoid "open but dead" states
+        std::this_thread::sleep_for(std::chrono::milliseconds(first_time ? 200 : 150));
+
+        while (run_.load()) {
+            bool ok = false;
+            {
+                std::lock_guard<std::mutex> lk(serial_mtx_);
+                ok = serial_.open(port, 115200);
+            }
+            if (ok) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        if (!run_.load()) return false;
+
+        // Settle time after open (CDC ACM often resets MCU)
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    }
-    if (!run_.load()) return;
 
-    // Give Pico/CDC a moment to settle after opening (common on ACM)
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        // Flush any junk/partial bytes
+        {
+            std::lock_guard<std::mutex> lk(serial_mtx_);
+            uint8_t junk[256];
+            for (int i = 0; i < 10; ++i) (void)serial_.read(junk, (int)sizeof(junk));
+        }
+        return true;
+    };
 
-    // Flush any partial junk bytes (optional but helpful)
-    {
-        std::lock_guard<std::mutex> lk(serial_mtx_);
-        uint8_t junk[256];
-        for (int i = 0; i < 10; ++i) (void)serial_.read(junk, (int)sizeof(junk));
-    }
+    if (!reopen_and_settle(true)) return;
 
     std::vector<uint8_t> frame;
     frame.reserve(256);
 
     uint8_t decoded[256];
+    uint8_t buf[512];
 
     auto t0 = std::chrono::steady_clock::now();
     uint64_t frames_in_window = 0;
     auto hz_window_start = t0;
 
-    uint8_t buf[512];
+    // NEW: last time we successfully decoded a valid telemetry frame
+    auto last_good_frame = std::chrono::steady_clock::now();
+
+    // NEW: parser reset helper (important after reopen)
+    auto reset_parser = [&]() {
+        frame.clear();
+        frames_in_window = 0;
+        hz_window_start = std::chrono::steady_clock::now();
+        last_good_frame = std::chrono::steady_clock::now();
+    };
 
     while (run_.load()) {
+        // NEW: timeout-based retry if no good frames for 0.5s
+        {
+            auto now = std::chrono::steady_clock::now();
+            if (now - last_good_frame > std::chrono::milliseconds(500)) {
+                // attempt reopen
+                if (!reopen_and_settle(false)) break;
+                reset_parser();
+            }
+        }
+
         int n = 0;
         {
             std::lock_guard<std::mutex> lk(serial_mtx_);
             n = serial_.read(buf, (int)sizeof(buf));
         }
-        static int zero_reads = 0;
-if (n == 0) {
-    zero_reads++;
-    if (zero_reads > 200) { // ~200 iterations with no data
-        // Reopen port
-        std::lock_guard<std::mutex> lk(serial_mtx_);
-        serial_.close();
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        serial_.open(port, 115200);
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        zero_reads = 0;
-    } else {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    continue;
-}
-zero_reads = 0;
+        if (n == 0) {
+            // A small sleep prevents a hot spin if read returns 0 for any reason
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
 
         for (int i = 0; i < n; ++i) {
             uint8_t b = buf[i];
+
             if (b == 0x00) {
                 if (!frame.empty()) {
-                    bool ok = false;
+                    bool good = false;
                     try {
                         size_t dec_len = cobs_decode(frame.data(), frame.size(), decoded, sizeof(decoded));
+
                         if (dec_len < sizeof(TelemetryHeader) + 2) {
                             std::lock_guard<std::mutex> lk(mtx_);
                             st_.reject_len++; st_.bad_frames++;
@@ -341,6 +365,10 @@ zero_reads = 0;
                             ingestLocked(h, p, tsec);
                         }
 
+                        // NEW: mark as good frame received
+                        last_good_frame = std::chrono::steady_clock::now();
+                        good = true;
+
                         frames_in_window++;
                         float dt = std::chrono::duration<float>(now - hz_window_start).count();
                         if (dt >= 1.0f) {
@@ -350,17 +378,16 @@ zero_reads = 0;
                             frames_in_window = 0;
                             hz_window_start = now;
                         }
-
-                        ok = true;
                     } catch (...) {
-                        // ok stays false
+                        // keep going; bad frames happen during reconnect/startup
                     }
-                    (void)ok;
+
+                    (void)good;
                     frame.clear();
                 }
             } else {
                 if (frame.size() < 255) frame.push_back(b);
-                else frame.clear();
+                else frame.clear(); // oversize -> drop
             }
         }
     }
