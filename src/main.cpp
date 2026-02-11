@@ -203,14 +203,15 @@ int main(int argc, char** argv) {
         ImGui::Begin("##RTE_ROOT", nullptr, flags);
 
         // header
-        ImGui::Text("Port: %s | RX: %.1f Hz | Seq: %u | Good: %llu | Bad: %llu | Reject: dec=%llu crc=%llu hdr=%llu len=%llu",
-                    port.c_str(), st.rx_hz, st.last_seq,
-                    (unsigned long long)st.good_frames,
-                    (unsigned long long)st.bad_frames,
-                    (unsigned long long)st.reject_decode,
-                    (unsigned long long)st.reject_crc,
-                    (unsigned long long)st.reject_hdr,
-                    (unsigned long long)st.reject_len);
+       ImGui::Text("Port: %s | RX: %.1f Hz | Seq: %u | Good: %llu | Bad: %llu | Reject: crc=%llu hdr=%llu len=%llu parse=%llu unknown_id=%llu",
+    port.c_str(), st.rx_hz, st.last_seq,
+    (unsigned long long)st.good_frames,
+    (unsigned long long)st.bad_frames,
+    (unsigned long long)st.reject_crc,
+    (unsigned long long)st.reject_hdr,
+    (unsigned long long)st.reject_len,
+    (unsigned long long)st.reject_payload_parse,
+    (unsigned long long)st.reject_unknown_id);
         ImGui::Separator();
 
         // --- main split: selection vs graphs ---

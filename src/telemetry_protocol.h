@@ -16,21 +16,27 @@
   static constexpr SerialHandle INVALID_SERIAL = -1;
 #endif
 
+static constexpr uint32_t MAGIC   = 0x544C4D31u; // "TLM1"
+static constexpr uint8_t  VERSION = 1;
+
+enum MsgType : uint8_t {
+    MSG_DATA   = 1,
+    MSG_DEFINE = 2,
+};
+
+enum ValueType : uint8_t {
+    VT_F32 = 1,
+    VT_STR = 2,
+};
+
 #pragma pack(push, 1)
 struct TelemetryHeader {
-    uint32_t magic;       // "TLM1" = 0x544C4D31
-    uint8_t  version;     // 1
-    uint8_t  msg_type;    // 1 = telemetry
+    uint32_t magic;       // MAGIC
+    uint8_t  version;     // VERSION
+    uint8_t  msg_type;    // MsgType
     uint16_t payload_len; // bytes
     uint32_t seq;
     uint32_t time_us;     // pico time_us_32()
-};
-
-struct TelemetryPayloadV1 {
-    float v_dc, v_u, v_v, v_w;
-    float i_dc_main, i_u, i_w;
-    float enc_sin, enc_cos, rotor_deg;
-    float sensor_rate_khz;
 };
 #pragma pack(pop)
 
@@ -40,8 +46,12 @@ struct SignalHistory {
 };
 
 struct TelemetryState {
+    // Float signals only (for plotting)
     std::unordered_map<std::string, float> latest;
     std::unordered_map<std::string, SignalHistory> hist;
+
+    // String signals (latest only)
+    std::unordered_map<std::string, std::string> latest_str;
 
     uint32_t last_seq = 0;
     float rx_hz = 0.0f;
@@ -52,6 +62,10 @@ struct TelemetryState {
     uint64_t reject_crc    = 0;
     uint64_t reject_hdr    = 0;
     uint64_t reject_len    = 0;
+
+    // New: protocol-level rejects
+    uint64_t reject_unknown_id = 0;
+    uint64_t reject_payload_parse = 0;
 };
 
 class SerialPort {
@@ -75,34 +89,45 @@ public:
     bool start(const std::string& port);
     void stop();
 
-    // Thread-safe snapshot copy
     TelemetryState snapshot() const;
 
-    // Send ASCII command (adds '\n' if needed)
     bool sendLine(const std::string& line);
 
-    // Settings (thread-safe via atomics)
     void setRetainSeconds(float s) { retain_seconds_.store(s); }
     void setMaxSamples(int n)      { max_samples_.store(n); }
 
 private:
     void threadMain(const std::string& port);
-    void ingestLocked(const TelemetryHeader& h, const TelemetryPayloadV1& p, float tsec);
+
+    // ingest helpers (caller holds mtx_)
+    void ingestF32Locked(const std::string& key, float v, float tsec);
+    void ingestStrLocked(const std::string& key, const std::string& v);
+
     void trimHistoryLocked(SignalHistory& H);
+
+    // NEW: dynamic key registry (id -> (type,key))
+    struct KeyDef {
+        uint8_t type = 0;
+        std::string key;
+    };
+    void onDefineLocked(uint16_t id, uint8_t type, const char* key, uint8_t key_len);
+    bool lookupKeyLocked(uint16_t id, KeyDef& out) const;
 
 private:
     mutable std::mutex mtx_;
+    void parseDefinePayloadLocked_(const uint8_t* payload, size_t len);
+void parseDataPayloadLocked_(const uint8_t* payload, size_t len, float tsec);
+
     TelemetryState st_;
+    std::unordered_map<uint16_t, KeyDef> id_to_key_; // guarded by mtx_
 
     std::atomic<bool> run_{false};
     std::atomic<float> retain_seconds_{30.0f};
     std::atomic<int>   max_samples_{12000};
 
-    // reader thread
     struct ThreadImpl;
     ThreadImpl* thr_ = nullptr;
 
-    // serial
     mutable std::mutex serial_mtx_;
     SerialPort serial_;
 };

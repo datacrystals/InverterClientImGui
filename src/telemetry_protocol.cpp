@@ -12,10 +12,7 @@
   #include <sys/ioctl.h>
 #endif
 
-static constexpr uint32_t MAGIC = 0x544C4D31u; // "TLM1"
-static constexpr uint8_t  VERSION = 1;
-static constexpr uint8_t  MSG_TELEMETRY = 1;
-
+// ---------------- CRC16-CCITT (0x1021, init 0xFFFF) ----------------
 static uint16_t crc16_ccitt(const uint8_t* data, size_t len) {
     uint16_t crc = 0xFFFF;
     for (size_t i = 0; i < len; ++i) {
@@ -26,6 +23,7 @@ static uint16_t crc16_ccitt(const uint8_t* data, size_t len) {
     return crc;
 }
 
+// ---------------- COBS decode ----------------
 static size_t cobs_decode(const uint8_t* in, size_t len, uint8_t* out, size_t out_cap) {
     size_t r = 0, w = 0;
     while (r < len) {
@@ -42,6 +40,25 @@ static size_t cobs_decode(const uint8_t* in, size_t len, uint8_t* out, size_t ou
         }
     }
     return w;
+}
+
+// ---------------- Payload decoding helpers ----------------
+static inline uint16_t rd_u16(const uint8_t*& p, const uint8_t* end) {
+    if (end - p < 2) throw std::runtime_error("u16");
+    uint16_t v = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+    p += 2;
+    return v;
+}
+static inline uint8_t rd_u8(const uint8_t*& p, const uint8_t* end) {
+    if (end - p < 1) throw std::runtime_error("u8");
+    return *p++;
+}
+static inline float rd_f32(const uint8_t*& p, const uint8_t* end) {
+    if (end - p < 4) throw std::runtime_error("f32");
+    float f;
+    std::memcpy(&f, p, 4);
+    p += 4;
+    return f;
 }
 
 // ---------------- SerialPort ----------------
@@ -115,7 +132,6 @@ bool SerialPort::open(const std::string& port, int baud) {
 
     if (tcsetattr(fd, TCSANOW, &tty) != 0) { ::close(fd); return false; }
 
-    // assert DTR/RTS
     int flags = 0;
     if (ioctl(fd, TIOCMGET, &flags) != -1) {
         flags |= (TIOCM_DTR | TIOCM_RTS);
@@ -157,14 +173,9 @@ struct TelemetryClient::ThreadImpl {
     std::thread t;
 };
 
-static inline void set_latest(TelemetryState& S, const char* name, float v) {
-    S.latest[name] = v;
-}
-
 bool TelemetryClient::start(const std::string& port) {
     stop();
     run_.store(true);
-
     thr_ = new ThreadImpl();
     thr_->t = std::thread(&TelemetryClient::threadMain, this, port);
     return true;
@@ -190,7 +201,6 @@ bool TelemetryClient::sendLine(const std::string& line) {
     std::string out = line;
     if (out.empty()) return false;
     if (out.back() != '\n' && out.back() != '\r') out.push_back('\n');
-
     std::lock_guard<std::mutex> lk(serial_mtx_);
     return serial_.write((const uint8_t*)out.data(), (int)out.size());
 }
@@ -213,31 +223,123 @@ void TelemetryClient::trimHistoryLocked(SignalHistory& H) {
     }
 }
 
-void TelemetryClient::ingestLocked(const TelemetryHeader& h, const TelemetryPayloadV1& p, float tsec) {
+void TelemetryClient::ingestF32Locked(const std::string& key, float v, float tsec) {
     auto& S = st_;
-    auto push = [&](const char* name, float v) {
-        S.latest[name] = v;
-        auto& H = S.hist[name];
-        H.t.push_back(tsec);
-        H.y.push_back(v);
-        trimHistoryLocked(H);
-    };
-
-    push("V_DC_BUS", p.v_dc);
-    push("V_PH_U",   p.v_u);
-    push("V_PH_V",   p.v_v);
-    push("V_PH_W",   p.v_w);
-    push("I_DC_MAIN", p.i_dc_main);
-    push("I_PH_U",    p.i_u);
-    push("I_PH_W",    p.i_w);
-    push("ENCODER_SIN", p.enc_sin);
-    push("ENCODER_COS", p.enc_cos);
-    push("ROTOR_DEG",   p.rotor_deg);
-    push("SENSOR_RATE_KHZ", p.sensor_rate_khz);
-
-    S.last_seq = h.seq;
-    S.good_frames++;
+    S.latest[key] = v;
+    auto& H = S.hist[key];
+    H.t.push_back(tsec);
+    H.y.push_back(v);
+    trimHistoryLocked(H);
 }
+
+void TelemetryClient::ingestStrLocked(const std::string& key, const std::string& v) {
+    st_.latest_str[key] = v;
+}
+
+void TelemetryClient::onDefineLocked(uint16_t id, uint8_t type, const char* key, uint8_t key_len) {
+    if (!key || key_len == 0) return;
+    KeyDef def;
+    def.type = type;
+    def.key.assign(key, key + key_len);
+    id_to_key_[id] = std::move(def);
+}
+
+bool TelemetryClient::lookupKeyLocked(uint16_t id, KeyDef& out) const {
+    auto it = id_to_key_.find(id);
+    if (it == id_to_key_.end()) return false;
+    out = it->second;
+    return true;
+}
+
+// --------- NEW: member payload parsers (can access private members) ----------
+void TelemetryClient::parseDefinePayloadLocked_(const uint8_t* payload, size_t len) {
+    const uint8_t* p = payload;
+    const uint8_t* end = payload + len;
+
+    uint8_t n = rd_u8(p, end);
+
+    for (uint8_t i = 0; i < n; ++i) {
+        uint16_t id = rd_u16(p, end);
+        uint8_t type = rd_u8(p, end);
+        uint8_t klen = rd_u8(p, end);
+        if ((size_t)(end - p) < klen) throw std::runtime_error("klen");
+        onDefineLocked(id, type, (const char*)p, klen);
+        p += klen;
+    }
+}
+
+void TelemetryClient::parseDataPayloadLocked_(const uint8_t* payload, size_t len, float tsec) {
+    const uint8_t* p = payload;
+    const uint8_t* end = payload + len;
+
+    uint8_t n = rd_u8(p, end);
+
+    for (uint8_t i = 0; i < n; ++i) {
+        uint16_t id = rd_u16(p, end);
+        uint8_t wire_type = rd_u8(p, end);
+
+        KeyDef def;
+        if (!lookupKeyLocked(id, def)) {
+            st_.reject_unknown_id++;
+            // Skip value based on wire_type (so we stay in sync)
+            if (wire_type == VT_F32) {
+                (void)rd_f32(p, end);
+            } else if (wire_type == VT_STR) {
+                uint8_t sl = rd_u8(p, end);
+                if ((size_t)(end - p) < sl) throw std::runtime_error("str");
+                p += sl;
+            } else {
+                throw std::runtime_error("bad type");
+            }
+            continue;
+        }
+
+        // Trust DEFINE type, but still advance using the on-wire encoding.
+        if (def.type == VT_F32) {
+            // If wire_type isn't VT_F32, try to skip safely and count it.
+            if (wire_type != VT_F32) {
+                st_.reject_payload_parse++;
+                if (wire_type == VT_STR) {
+                    uint8_t sl = rd_u8(p, end);
+                    if ((size_t)(end - p) < sl) throw std::runtime_error("str");
+                    p += sl;
+                } else {
+                    throw std::runtime_error("wire type");
+                }
+                continue;
+            }
+            float v = rd_f32(p, end);
+            ingestF32Locked(def.key, v, tsec);
+        } else if (def.type == VT_STR) {
+            if (wire_type != VT_STR) {
+                st_.reject_payload_parse++;
+                if (wire_type == VT_F32) {
+                    (void)rd_f32(p, end);
+                } else {
+                    throw std::runtime_error("wire type");
+                }
+                continue;
+            }
+            uint8_t sl = rd_u8(p, end);
+            if ((size_t)(end - p) < sl) throw std::runtime_error("str");
+            std::string s((const char*)p, (const char*)p + sl);
+            p += sl;
+            ingestStrLocked(def.key, s);
+        } else {
+            st_.reject_payload_parse++;
+            throw std::runtime_error("unknown def type");
+        }
+    }
+}
+
+// NOTE: these are private helpers, but we didn't declare them in the header yet.
+// Add these two private declarations to TelemetryClient in telemetry_protocol.h:
+//
+//   void parseDefinePayloadLocked_(const uint8_t* payload, size_t len);
+//   void parseDataPayloadLocked_(const uint8_t* payload, size_t len, float tsec);
+//
+// (Or, if you prefer, inline the parsing directly into threadMain under the lock.)
+
 void TelemetryClient::threadMain(const std::string& port) {
     auto reopen_and_settle = [&](bool first_time) {
         {
@@ -245,7 +347,6 @@ void TelemetryClient::threadMain(const std::string& port) {
             serial_.close();
         }
 
-        // On some platforms/USB CDC, a short delay helps avoid "open but dead" states
         std::this_thread::sleep_for(std::chrono::milliseconds(first_time ? 200 : 150));
 
         while (run_.load()) {
@@ -259,10 +360,8 @@ void TelemetryClient::threadMain(const std::string& port) {
         }
         if (!run_.load()) return false;
 
-        // Settle time after open (CDC ACM often resets MCU)
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-        // Flush any junk/partial bytes
         {
             std::lock_guard<std::mutex> lk(serial_mtx_);
             uint8_t junk[256];
@@ -274,19 +373,17 @@ void TelemetryClient::threadMain(const std::string& port) {
     if (!reopen_and_settle(true)) return;
 
     std::vector<uint8_t> frame;
-    frame.reserve(256);
+    frame.reserve(512);
 
-    uint8_t decoded[256];
+    uint8_t decoded[2048];
     uint8_t buf[512];
 
     auto t0 = std::chrono::steady_clock::now();
     uint64_t frames_in_window = 0;
     auto hz_window_start = t0;
 
-    // NEW: last time we successfully decoded a valid telemetry frame
     auto last_good_frame = std::chrono::steady_clock::now();
 
-    // NEW: parser reset helper (important after reopen)
     auto reset_parser = [&]() {
         frame.clear();
         frames_in_window = 0;
@@ -295,11 +392,9 @@ void TelemetryClient::threadMain(const std::string& port) {
     };
 
     while (run_.load()) {
-        // NEW: timeout-based retry if no good frames for 0.5s
         {
             auto now = std::chrono::steady_clock::now();
             if (now - last_good_frame > std::chrono::milliseconds(500)) {
-                // attempt reopen
                 if (!reopen_and_settle(false)) break;
                 reset_parser();
             }
@@ -311,7 +406,6 @@ void TelemetryClient::threadMain(const std::string& port) {
             n = serial_.read(buf, (int)sizeof(buf));
         }
         if (n == 0) {
-            // A small sleep prevents a hot spin if read returns 0 for any reason
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
@@ -321,7 +415,7 @@ void TelemetryClient::threadMain(const std::string& port) {
 
             if (b == 0x00) {
                 if (!frame.empty()) {
-                    bool good = false;
+                    bool parsed_ok = false;
                     try {
                         size_t dec_len = cobs_decode(frame.data(), frame.size(), decoded, sizeof(decoded));
 
@@ -331,8 +425,9 @@ void TelemetryClient::threadMain(const std::string& port) {
                             throw std::runtime_error("short");
                         }
 
-                        uint16_t rx_crc = (uint16_t)decoded[dec_len - 2] | ((uint16_t)decoded[dec_len - 1] << 8);
-                        uint16_t calc   = crc16_ccitt(decoded, dec_len - 2);
+                        uint16_t rx_crc = (uint16_t)decoded[dec_len - 2] |
+                                          ((uint16_t)decoded[dec_len - 1] << 8);
+                        uint16_t calc = crc16_ccitt(decoded, dec_len - 2);
                         if (rx_crc != calc) {
                             std::lock_guard<std::mutex> lk(mtx_);
                             st_.reject_crc++; st_.bad_frames++;
@@ -341,33 +436,38 @@ void TelemetryClient::threadMain(const std::string& port) {
 
                         TelemetryHeader h{};
                         std::memcpy(&h, decoded, sizeof(h));
-                        if (h.magic != MAGIC || h.version != VERSION || h.msg_type != MSG_TELEMETRY) {
+                        if (h.magic != MAGIC || h.version != VERSION ||
+                            (h.msg_type != MSG_DATA && h.msg_type != MSG_DEFINE)) {
                             std::lock_guard<std::mutex> lk(mtx_);
                             st_.reject_hdr++; st_.bad_frames++;
                             throw std::runtime_error("hdr");
                         }
 
-                        if (h.payload_len != sizeof(TelemetryPayloadV1) ||
-                            sizeof(TelemetryHeader) + h.payload_len + 2 != dec_len) {
+                        if (sizeof(TelemetryHeader) + h.payload_len + 2 != dec_len) {
                             std::lock_guard<std::mutex> lk(mtx_);
                             st_.reject_len++; st_.bad_frames++;
                             throw std::runtime_error("len");
                         }
 
-                        TelemetryPayloadV1 p{};
-                        std::memcpy(&p, decoded + sizeof(TelemetryHeader), sizeof(p));
-
                         auto now = std::chrono::steady_clock::now();
                         float tsec = std::chrono::duration<float>(now - t0).count();
 
+                        const uint8_t* payload = decoded + sizeof(TelemetryHeader);
+                        const size_t plen = h.payload_len;
+
                         {
                             std::lock_guard<std::mutex> lk(mtx_);
-                            ingestLocked(h, p, tsec);
+                            if (h.msg_type == MSG_DEFINE) {
+                                parseDefinePayloadLocked_(payload, plen);
+                            } else {
+                                parseDataPayloadLocked_(payload, plen, tsec);
+                            }
+                            st_.last_seq = h.seq;
+                            st_.good_frames++;
                         }
 
-                        // NEW: mark as good frame received
+                        parsed_ok = true;
                         last_good_frame = std::chrono::steady_clock::now();
-                        good = true;
 
                         frames_in_window++;
                         float dt = std::chrono::duration<float>(now - hz_window_start).count();
@@ -380,13 +480,16 @@ void TelemetryClient::threadMain(const std::string& port) {
                         }
                     } catch (...) {
                         // keep going; bad frames happen during reconnect/startup
+                        std::lock_guard<std::mutex> lk(mtx_);
+                        st_.bad_frames++;
+                        // reject counters already bumped for crc/hdr/len. If it was payload parse, mark it:
+                        if (!parsed_ok) st_.reject_payload_parse++;
                     }
 
-                    (void)good;
                     frame.clear();
                 }
             } else {
-                if (frame.size() < 255) frame.push_back(b);
+                if (frame.size() < 2040) frame.push_back(b);
                 else frame.clear(); // oversize -> drop
             }
         }
