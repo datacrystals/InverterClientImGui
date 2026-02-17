@@ -373,9 +373,9 @@ void TelemetryClient::threadMain(const std::string& port) {
     if (!reopen_and_settle(true)) return;
 
     std::vector<uint8_t> frame;
-    frame.reserve(512);
+    frame.reserve(1024);
 
-    uint8_t decoded[2048];
+    uint8_t decoded[4096];
     uint8_t buf[512];
 
     auto t0 = std::chrono::steady_clock::now();
@@ -489,7 +489,7 @@ void TelemetryClient::threadMain(const std::string& port) {
                     frame.clear();
                 }
             } else {
-                if (frame.size() < 2040) frame.push_back(b);
+                if (frame.size() < 4096) frame.push_back(b);
                 else frame.clear(); // oversize -> drop
             }
         }
