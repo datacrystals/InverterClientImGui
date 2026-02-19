@@ -20,6 +20,10 @@ static void cmdlog_push(const std::string& s) {
     g_cmdlog.push_back(s);
     while (g_cmdlog.size() > g_cmdlog_cap) g_cmdlog.pop_front();
 }
+// --- Telemetry console drain + autoscroll state ---
+static uint64_t g_last_console_seq = 0; // last consumed console seq
+static bool     g_cmdlog_new_lines = false;
+static bool     g_cmdlog_autoscroll = true;
 
 // Three independent plot sets
 static std::unordered_set<std::string> g_plot_set[3];
@@ -178,7 +182,7 @@ int main(int argc, char** argv) {
 
     // Adjustable sizes (persist across frames)
     static float left_w = 520.0f;           // selection area width
-    static float left_console_h = 120.0f;   // console height inside left
+    static float left_console_h = 240.0f;   // console height inside left
     static float g1_h = 220.0f;             // graph1 height
     static float g2_h = 220.0f;             // graph2 height (graph3 is remainder)
 
@@ -189,6 +193,20 @@ int main(int argc, char** argv) {
         ImGui::NewFrame();
 
         TelemetryState st = client.snapshot();
+
+        //printf handling
+        // Drain telemetry console lines into g_cmdlog using seq numbers (works with culling)
+        for (const auto& ln : st.console) {
+            if (ln.seq > g_last_console_seq) {
+                cmdlog_push(ln.text);
+                g_cmdlog_new_lines = true;
+            }
+        }
+        if (!st.console.empty()) {
+            g_last_console_seq = std::max(g_last_console_seq, st.console.back().seq);
+        }
+
+
 
         ImGuiViewport* vp = ImGui::GetMainViewport();
         ImGui::SetNextWindowPos(vp->WorkPos);
@@ -303,7 +321,11 @@ int main(int argc, char** argv) {
         ImGui::BeginChild("##console_left", ImVec2(0, 0), false);
 
         // Header row
-        if (ImGui::SmallButton("Clear")) g_cmdlog.clear();
+        if (ImGui::SmallButton("Clear")) {
+    g_cmdlog.clear();
+    g_cmdlog_new_lines = true;
+    // Optional: do NOT reset g_last_console_n, so we don't re-add old telemetry lines.
+}
         ImGui::SameLine();
         ImGui::TextUnformatted("Commands");
         ImGui::Separator();
@@ -317,9 +339,27 @@ int main(int argc, char** argv) {
         log_h = std::max(20.0f, log_h);
 
         // Log (top of console)
-        ImGui::BeginChild("##cmdlog", ImVec2(0, log_h), false);
-        for (auto& line : g_cmdlog) ImGui::TextUnformatted(line.c_str());
-        ImGui::EndChild();
+ImGui::BeginChild("##cmdlog", ImVec2(0, log_h), false);
+
+// draw lines
+for (auto& line : g_cmdlog) ImGui::TextUnformatted(line.c_str());
+
+// Auto-scroll:
+// only scroll if user is already at/near bottom, so we don't fight manual scrolling
+if (g_cmdlog_autoscroll && g_cmdlog_new_lines) {
+    float maxY = ImGui::GetScrollMaxY();
+    float curY = ImGui::GetScrollY();
+    bool user_at_bottom = (maxY - curY) < 5.0f;
+    if (user_at_bottom) {
+        ImGui::SetScrollHereY(1.0f);
+    }
+}
+
+ImGui::EndChild();
+
+// reset new-lines flag once we've rendered
+g_cmdlog_new_lines = false;
+
 
         // Input row pinned near bottom, with same padding as the rest
         ImGui::AlignTextToFramePadding();
@@ -343,6 +383,7 @@ int main(int argc, char** argv) {
                 bool ok = client.sendLine(cmd);
                 cmdlog_push(std::string("> ") + cmd);
                 cmdlog_push(ok ? "  (sent)" : "  (FAILED to send)");
+                g_cmdlog_new_lines = true;
                 cmd_buf[0] = 0;
             }
             focus_cmd = true;

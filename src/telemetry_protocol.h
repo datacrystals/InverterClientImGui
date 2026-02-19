@@ -44,8 +44,12 @@ struct SignalHistory {
     std::deque<float> t;
     std::deque<float> y;
 };
-
+struct ConsoleLine {
+    uint64_t seq = 0;
+    std::string text;
+};
 struct TelemetryState {
+    std::deque<ConsoleLine> console;
     // Float signals only (for plotting)
     std::unordered_map<std::string, float> latest;
     std::unordered_map<std::string, SignalHistory> hist;
@@ -90,7 +94,7 @@ public:
     void stop();
 
     TelemetryState snapshot() const;
-
+    void ingestStrLocked(const std::string& key, const std::string& v);
     bool sendLine(const std::string& line);
 
     void setRetainSeconds(float s) { retain_seconds_.store(s); }
@@ -101,7 +105,6 @@ private:
 
     // ingest helpers (caller holds mtx_)
     void ingestF32Locked(const std::string& key, float v, float tsec);
-    void ingestStrLocked(const std::string& key, const std::string& v);
 
     void trimHistoryLocked(SignalHistory& H);
 

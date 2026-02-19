@@ -169,6 +169,8 @@ bool SerialPort::write(const uint8_t* data, int n) {
 }
 
 // ---------------- TelemetryClient ----------------
+static constexpr size_t   CONSOLE_CAP_LINES = 6000;
+static uint64_t           g_console_seq = 0;
 struct TelemetryClient::ThreadImpl {
     std::thread t;
 };
@@ -230,10 +232,6 @@ void TelemetryClient::ingestF32Locked(const std::string& key, float v, float tse
     H.t.push_back(tsec);
     H.y.push_back(v);
     trimHistoryLocked(H);
-}
-
-void TelemetryClient::ingestStrLocked(const std::string& key, const std::string& v) {
-    st_.latest_str[key] = v;
 }
 
 void TelemetryClient::onDefineLocked(uint16_t id, uint8_t type, const char* key, uint8_t key_len) {
@@ -339,6 +337,14 @@ void TelemetryClient::parseDataPayloadLocked_(const uint8_t* payload, size_t len
 //   void parseDataPayloadLocked_(const uint8_t* payload, size_t len, float tsec);
 //
 // (Or, if you prefer, inline the parsing directly into threadMain under the lock.)
+void TelemetryClient::ingestStrLocked(const std::string& key, const std::string& v) {
+    st_.latest_str[key] = v;
+
+    if (key == "print") {
+        st_.console.push_back(ConsoleLine{++g_console_seq, v});
+        while (st_.console.size() > CONSOLE_CAP_LINES) st_.console.pop_front();
+    }
+}
 
 void TelemetryClient::threadMain(const std::string& port) {
     auto reopen_and_settle = [&](bool first_time) {
