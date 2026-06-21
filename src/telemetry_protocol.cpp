@@ -87,7 +87,7 @@ void SerialPort::close() {
 }
 
 bool SerialPort::open(const std::string& port, int baud) {
-    (void)baud; // fixed at 115200 below
+    (void)baud; // fixed at 460800 below
     close();
 
 #ifdef _WIN32
@@ -98,7 +98,7 @@ bool SerialPort::open(const std::string& port, int baud) {
     DCB dcb{}; dcb.DCBlength = sizeof(dcb);
     if (!GetCommState(h, &dcb)) { CloseHandle(h); return false; }
 
-    dcb.BaudRate = CBR_115200;
+    dcb.BaudRate = 460800;
     dcb.ByteSize = 8;
     dcb.Parity   = NOPARITY;
     dcb.StopBits = ONESTOPBIT;
@@ -116,31 +116,25 @@ bool SerialPort::open(const std::string& port, int baud) {
     return true;
 #else
     int fd = ::open(port.c_str(), O_RDWR | O_NOCTTY);
-    if (fd < 0) return false;
+if (fd < 0) return false;
 
-    termios tty{};
-    if (tcgetattr(fd, &tty) != 0) { ::close(fd); return false; }
+termios tty{};
+if (tcgetattr(fd, &tty) != 0) { ::close(fd); return false; }
 
-    cfsetispeed(&tty, B115200);
-    cfsetospeed(&tty, B115200);
-    cfmakeraw(&tty);
+cfsetispeed(&tty, B460800);
+cfsetospeed(&tty, B460800);
+cfmakeraw(&tty);
 
-    tty.c_cflag |= (CLOCAL | CREAD);
-    tty.c_cflag &= ~CRTSCTS;
-    tty.c_cc[VMIN]  = 1;
-    tty.c_cc[VTIME] = 0;
+tty.c_cflag |= (CLOCAL | CREAD);
+tty.c_cflag &= ~CRTSCTS;
+tty.c_cc[VMIN]  = 0;
+tty.c_cc[VTIME] = 1;
 
-    if (tcsetattr(fd, TCSANOW, &tty) != 0) { ::close(fd); return false; }
+if (tcsetattr(fd, TCSANOW, &tty) != 0) { ::close(fd); return false; }
 
-    int flags = 0;
-    if (ioctl(fd, TIOCMGET, &flags) != -1) {
-        flags |= (TIOCM_DTR | TIOCM_RTS);
-        ioctl(fd, TIOCMSET, &flags);
-    }
-
-    tcflush(fd, TCIFLUSH);
-    h_ = fd;
-    return true;
+tcflush(fd, TCIFLUSH);
+h_ = fd;
+return true;
 #endif
 }
 
@@ -359,7 +353,7 @@ void TelemetryClient::threadMain(const std::string& port) {
             bool ok = false;
             {
                 std::lock_guard<std::mutex> lk(serial_mtx_);
-                ok = serial_.open(port, 115200);
+                ok = serial_.open(port, 460800);
             }
             if (ok) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -368,11 +362,11 @@ void TelemetryClient::threadMain(const std::string& port) {
 
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-        {
-            std::lock_guard<std::mutex> lk(serial_mtx_);
-            uint8_t junk[256];
-            for (int i = 0; i < 10; ++i) (void)serial_.read(junk, (int)sizeof(junk));
-        }
+        // {
+        //     std::lock_guard<std::mutex> lk(serial_mtx_);
+        //     uint8_t junk[256];
+        //     for (int i = 0; i < 10; ++i) (void)serial_.read(junk, (int)sizeof(junk));
+        // }
         return true;
     };
 
@@ -400,7 +394,7 @@ void TelemetryClient::threadMain(const std::string& port) {
     while (run_.load()) {
         {
             auto now = std::chrono::steady_clock::now();
-            if (now - last_good_frame > std::chrono::milliseconds(500)) {
+            if (now - last_good_frame > std::chrono::seconds(2)) {
                 if (!reopen_and_settle(false)) break;
                 reset_parser();
             }
@@ -487,7 +481,7 @@ void TelemetryClient::threadMain(const std::string& port) {
                     } catch (...) {
                         // keep going; bad frames happen during reconnect/startup
                         std::lock_guard<std::mutex> lk(mtx_);
-                        st_.bad_frames++;
+                        // st_.bad_frames++;
                         // reject counters already bumped for crc/hdr/len. If it was payload parse, mark it:
                         if (!parsed_ok) st_.reject_payload_parse++;
                     }

@@ -77,7 +77,7 @@ public:
     SerialPort() = default;
     ~SerialPort();
 
-    bool open(const std::string& port, int baud = 115200);
+    bool open(const std::string& port, int baud = 460800);
     void close();
     bool isOpen() const;
 
