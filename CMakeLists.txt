@@ -38,6 +38,7 @@ set(IMPLOT_SOURCES
 add_executable(imgui_api_viewer
   src/main.cpp
   src/telemetry_protocol.cpp
+  src/config_manager.cpp
   ${IMGUI_SOURCES}
   ${IMPLOT_SOURCES}
 )

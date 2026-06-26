@@ -25,8 +25,16 @@ enum MsgType : uint8_t {
 };
 
 enum ValueType : uint8_t {
-    VT_F32 = 1,
-    VT_STR = 2,
+    VT_F32      = 1,
+    VT_STR      = 2,   // complete short string
+    VT_STR_FRAG = 3,   // fragment of a longer string
+};
+
+// Fragment flags for VT_STR_FRAG payloads
+enum StrFrag : uint8_t {
+    SF_START    = 0x01,
+    SF_END      = 0x02,
+    SF_COMPLETE = 0x03, // START | END
 };
 
 #pragma pack(push, 1)
@@ -83,6 +91,7 @@ public:
 
     int  read(uint8_t* buf, int cap);
     bool write(const uint8_t* data, int n);
+    bool drain();
 
 private:
     SerialHandle h_ = INVALID_SERIAL;
@@ -123,6 +132,13 @@ void parseDataPayloadLocked_(const uint8_t* payload, size_t len, float tsec);
 
     TelemetryState st_;
     std::unordered_map<uint16_t, KeyDef> id_to_key_; // guarded by mtx_
+
+    // Long-string reassembly (guarded by mtx_)
+    struct PartialString {
+        std::string buf;
+        float last_tsec = 0.0f;
+    };
+    std::unordered_map<std::string, PartialString> partial_str_;
 
     std::atomic<bool> run_{false};
     std::atomic<float> retain_seconds_{30.0f};

@@ -151,14 +151,37 @@ int SerialPort::read(uint8_t* buf, int cap) {
 }
 
 bool SerialPort::write(const uint8_t* data, int n) {
+    if (!isOpen() || !data || n <= 0) return false;
+#ifdef _WIN32
+    int total = 0;
+    while (total < n) {
+        DWORD wrote = 0;
+        if (!WriteFile(h_, data + total, (DWORD)(n - total), &wrote, nullptr)) return false;
+        if (wrote == 0) return false;
+        total += (int)wrote;
+    }
+    return true;
+#else
+    int total = 0;
+    while (total < n) {
+        int wrote = (int)::write(h_, data + total, (size_t)(n - total));
+        if (wrote < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (wrote == 0) return false;
+        total += wrote;
+    }
+    return true;
+#endif
+}
+
+bool SerialPort::drain() {
     if (!isOpen()) return false;
 #ifdef _WIN32
-    DWORD wrote = 0;
-    if (!WriteFile(h_, data, (DWORD)n, &wrote, nullptr)) return false;
-    return (int)wrote == n;
+    return FlushFileBuffers(h_) != 0;
 #else
-    int wrote = (int)::write(h_, data, (size_t)n);
-    return wrote == n;
+    return ::tcdrain(h_) == 0;
 #endif
 }
 
@@ -198,7 +221,8 @@ bool TelemetryClient::sendLine(const std::string& line) {
     if (out.empty()) return false;
     if (out.back() != '\n' && out.back() != '\r') out.push_back('\n');
     std::lock_guard<std::mutex> lk(serial_mtx_);
-    return serial_.write((const uint8_t*)out.data(), (int)out.size());
+    if (!serial_.write((const uint8_t*)out.data(), (int)out.size())) return false;
+    return serial_.drain();
 }
 
 void TelemetryClient::trimHistoryLocked(SignalHistory& H) {
@@ -280,6 +304,11 @@ void TelemetryClient::parseDataPayloadLocked_(const uint8_t* payload, size_t len
                 uint8_t sl = rd_u8(p, end);
                 if ((size_t)(end - p) < sl) throw std::runtime_error("str");
                 p += sl;
+            } else if (wire_type == VT_STR_FRAG) {
+                (void)rd_u8(p, end); // frag flags
+                uint8_t sl = rd_u8(p, end);
+                if ((size_t)(end - p) < sl) throw std::runtime_error("str frag");
+                p += sl;
             } else {
                 throw std::runtime_error("bad type");
             }
@@ -295,6 +324,11 @@ void TelemetryClient::parseDataPayloadLocked_(const uint8_t* payload, size_t len
                     uint8_t sl = rd_u8(p, end);
                     if ((size_t)(end - p) < sl) throw std::runtime_error("str");
                     p += sl;
+                } else if (wire_type == VT_STR_FRAG) {
+                    (void)rd_u8(p, end); // frag flags
+                    uint8_t sl = rd_u8(p, end);
+                    if ((size_t)(end - p) < sl) throw std::runtime_error("str frag");
+                    p += sl;
                 } else {
                     throw std::runtime_error("wire type");
                 }
@@ -303,20 +337,42 @@ void TelemetryClient::parseDataPayloadLocked_(const uint8_t* payload, size_t len
             float v = rd_f32(p, end);
             ingestF32Locked(def.key, v, tsec);
         } else if (def.type == VT_STR) {
-            if (wire_type != VT_STR) {
+            if (wire_type == VT_F32) {
                 st_.reject_payload_parse++;
-                if (wire_type == VT_F32) {
-                    (void)rd_f32(p, end);
-                } else {
-                    throw std::runtime_error("wire type");
-                }
+                (void)rd_f32(p, end);
                 continue;
             }
-            uint8_t sl = rd_u8(p, end);
-            if ((size_t)(end - p) < sl) throw std::runtime_error("str");
-            std::string s((const char*)p, (const char*)p + sl);
-            p += sl;
-            ingestStrLocked(def.key, s);
+            if (wire_type != VT_STR && wire_type != VT_STR_FRAG) {
+                st_.reject_payload_parse++;
+                throw std::runtime_error("wire type");
+            }
+
+            if (wire_type == VT_STR) {
+                uint8_t sl = rd_u8(p, end);
+                if ((size_t)(end - p) < sl) throw std::runtime_error("str");
+                std::string s((const char*)p, (const char*)p + sl);
+                p += sl;
+                partial_str_.erase(def.key);
+                ingestStrLocked(def.key, s);
+            } else { // VT_STR_FRAG
+                uint8_t frag = rd_u8(p, end);
+                uint8_t sl = rd_u8(p, end);
+                if ((size_t)(end - p) < sl) throw std::runtime_error("str frag");
+                std::string chunk((const char*)p, (const char*)p + sl);
+                p += sl;
+
+                auto& part = partial_str_[def.key];
+                if (frag & SF_START) {
+                    part.buf.clear();
+                }
+                part.buf += chunk;
+                part.last_tsec = tsec;
+
+                if (frag & SF_END) {
+                    ingestStrLocked(def.key, part.buf);
+                    partial_str_.erase(def.key);
+                }
+            }
         } else {
             st_.reject_payload_parse++;
             throw std::runtime_error("unknown def type");
@@ -462,6 +518,16 @@ void TelemetryClient::threadMain(const std::string& port) {
                             } else {
                                 parseDataPayloadLocked_(payload, plen, tsec);
                             }
+
+                            // Drop partial strings that haven't seen a fragment in 2s
+                            for (auto it = partial_str_.begin(); it != partial_str_.end(); ) {
+                                if (tsec - it->second.last_tsec > 2.0f) {
+                                    it = partial_str_.erase(it);
+                                } else {
+                                    ++it;
+                                }
+                            }
+
                             st_.last_seq = h.seq;
                             st_.good_frames++;
                         }

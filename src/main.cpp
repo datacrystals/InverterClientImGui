@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <deque>
@@ -12,6 +13,7 @@
 #include "imgui_internal.h"
 #include "implot.h"
 #include "telemetry_protocol.h"
+#include "config_manager.h"
 
 // ---------------- Command log only ----------------
 static std::deque<std::string> g_cmdlog;
@@ -27,6 +29,11 @@ static bool     g_cmdlog_autoscroll = true;
 
 // Three independent plot sets
 static std::unordered_set<std::string> g_plot_set[3];
+
+// Layout persistence
+static ConfigManager g_cfg_mgr;
+static char g_cfg_name[128] = {0};
+static std::string g_cfg_status;
 
 static const char* GuessYLabel(const std::string& name) {
     if (name.rfind("V_", 0) == 0) return "Volts (V)";
@@ -175,6 +182,11 @@ int main(int argc, char** argv) {
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init(glsl_version);
 
+    // Try to restore the last-used graph layout.
+    if (g_cfg_mgr.loadAutosave(g_plot_set)) {
+        g_cfg_status = "Loaded autosave layout";
+    }
+
     char filter[128] = {0};
     static char cmd_buf[256] = {0};
     static bool focus_cmd = true;
@@ -230,6 +242,67 @@ int main(int argc, char** argv) {
     (unsigned long long)st.reject_len,
     (unsigned long long)st.reject_payload_parse,
     (unsigned long long)st.reject_unknown_id);
+        ImGui::Separator();
+
+        // --- layout save/load ---
+        {
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted("Layout:");
+            ImGui::SameLine();
+
+            ImGui::SetNextItemWidth(180.0f);
+            ImGui::InputText("##cfg_name", g_cfg_name, sizeof(g_cfg_name));
+            ImGui::SameLine();
+
+            if (ImGui::Button("Save")) {
+                if (g_cfg_name[0] != '\0') {
+                    if (g_cfg_mgr.saveNamed(g_cfg_name, g_plot_set)) {
+                        g_cfg_status = std::string("Saved '") + g_cfg_name + "'";
+                    } else {
+                        g_cfg_status = std::string("Failed to save '") + g_cfg_name + "'";
+                    }
+                }
+            }
+
+            ImGui::SameLine();
+            ImGui::TextUnformatted("|");
+            ImGui::SameLine();
+
+            static int selected_recent = -1;
+            auto recent = g_cfg_mgr.recentConfigs();
+
+            ImGui::SetNextItemWidth(180.0f);
+            if (ImGui::BeginCombo("##recent", selected_recent >= 0 && selected_recent < (int)recent.size()
+                                                    ? recent[selected_recent].name.c_str()
+                                                    : "load recent...")) {
+                for (int i = 0; i < (int)recent.size(); ++i) {
+                    bool is_selected = (selected_recent == i);
+                    if (ImGui::Selectable(recent[i].name.c_str(), is_selected)) {
+                        selected_recent = i;
+                    }
+                    if (is_selected) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::SameLine();
+
+            if (ImGui::Button("Load") && selected_recent >= 0 && selected_recent < (int)recent.size()) {
+                std::string loaded_name;
+                if (g_cfg_mgr.load(recent[selected_recent].path, g_plot_set, &loaded_name)) {
+                    g_cfg_status = std::string("Loaded '") + loaded_name + "'";
+                    std::strncpy(g_cfg_name, loaded_name.c_str(), sizeof(g_cfg_name) - 1);
+                    g_cfg_name[sizeof(g_cfg_name) - 1] = '\0';
+                } else {
+                    g_cfg_status = "Failed to load selected layout";
+                }
+            }
+
+            if (!g_cfg_status.empty()) {
+                ImGui::SameLine();
+                ImGui::TextUnformatted(g_cfg_status.c_str());
+            }
+        }
+
         ImGui::Separator();
 
         // --- main split: selection vs graphs ---
@@ -341,8 +414,8 @@ int main(int argc, char** argv) {
         // Log (top of console)
 ImGui::BeginChild("##cmdlog", ImVec2(0, log_h), false);
 
-// draw lines
-for (auto& line : g_cmdlog) ImGui::TextUnformatted(line.c_str());
+// draw lines (wrap at window width so long strings are readable)
+for (auto& line : g_cmdlog) ImGui::TextWrapped("%s", line.c_str());
 
 // Auto-scroll:
 // only scroll if user is already at/near bottom, so we don't fight manual scrolling
@@ -454,6 +527,11 @@ g_cmdlog_new_lines = false;
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(window);
+    }
+
+    // Remember the current graph layout for next launch.
+    if (!g_cfg_mgr.saveAutosave(g_plot_set)) {
+        // No good way to report this late; ignore silently.
     }
 
     client.stop();
