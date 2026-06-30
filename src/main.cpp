@@ -173,6 +173,10 @@ int main(int argc, char** argv) {
     TelemetryClient client;
     client.start(port);
     g_fw_updater.setCurrentPort(port);
+    g_fw_updater.setSuspendCallback([&client](bool suspend) {
+        if (suspend) client.suspend();
+        else         client.resume();
+    });
 
     // Auto-start the HTTP firmware-update server on localhost.
     if (!g_http_server.start()) {

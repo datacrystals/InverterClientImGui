@@ -50,6 +50,10 @@ public:
     void setCurrentPort(const std::string& port);
     std::string currentPort() const;
 
+    // Callback to pause/resume the telemetry client while flashing so the
+    // serial port is not contended. argument true = suspend, false = resume.
+    void setSuspendCallback(std::function<void(bool)> cb);
+
     // Human-readable state string.
     static const char* stateString(FlashState s);
 
@@ -75,6 +79,7 @@ private:
     std::vector<std::string> log_;
     std::string last_error_;
     std::string current_port_;
+    std::function<void(bool)> suspend_cb_;
     bool busy_ = false;
 
     std::atomic<bool> run_{true};

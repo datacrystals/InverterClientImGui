@@ -101,6 +101,9 @@ class TelemetryClient {
 public:
     bool start(const std::string& port);
     void stop();
+    void suspend();
+    void resume();
+    bool isSuspended() const;
 
     TelemetryState snapshot() const;
     void ingestStrLocked(const std::string& key, const std::string& v);
@@ -141,6 +144,7 @@ void parseDataPayloadLocked_(const uint8_t* payload, size_t len, float tsec);
     std::unordered_map<std::string, PartialString> partial_str_;
 
     std::atomic<bool> run_{false};
+    std::atomic<bool> suspended_{false};
     std::atomic<float> retain_seconds_{30.0f};
     std::atomic<int>   max_samples_{12000};
 
