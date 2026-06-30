@@ -14,6 +14,8 @@
 #include "implot.h"
 #include "telemetry_protocol.h"
 #include "config_manager.h"
+#include "firmware_updater.h"
+#include "http_server.h"
 
 // ---------------- Command log only ----------------
 static std::deque<std::string> g_cmdlog;
@@ -34,6 +36,13 @@ static std::unordered_set<std::string> g_plot_set[3];
 static ConfigManager g_cfg_mgr;
 static char g_cfg_name[128] = {0};
 static std::string g_cfg_status;
+
+// Firmware update state
+static FirmwareUpdater g_fw_updater;
+static HttpFlashServer g_http_server(g_fw_updater, "18080");
+static char g_fw_path[512] = {0};
+static char g_http_port[16] = "18080";
+static bool g_fw_auto_gpio = true;
 
 static const char* GuessYLabel(const std::string& name) {
     if (name.rfind("V_", 0) == 0) return "Volts (V)";
@@ -163,6 +172,12 @@ int main(int argc, char** argv) {
 
     TelemetryClient client;
     client.start(port);
+    g_fw_updater.setCurrentPort(port);
+
+    // Auto-start the HTTP firmware-update server on localhost.
+    if (!g_http_server.start()) {
+        fprintf(stderr, "[WARN] Failed to auto-start HTTP firmware server on port %s\n", g_http_port);
+    }
 
     if (!glfwInit()) return 1;
     const char* glsl_version = "#version 130";
@@ -304,6 +319,9 @@ int main(int argc, char** argv) {
         }
 
         ImGui::Separator();
+
+        if (ImGui::BeginTabBar("##main_tabs", ImGuiTabBarFlags_None)) {
+            if (ImGui::BeginTabItem("Telemetry")) {
 
         // --- main split: selection vs graphs ---
         ImVec2 avail = ImGui::GetContentRegionAvail();
@@ -517,6 +535,83 @@ g_cmdlog_new_lines = false;
         PlotSet("##telemetry_plot_3", st, g_plot_set[2], view_seconds, g3_h);
 
         ImGui::EndChild(); // right
+
+                ImGui::EndTabItem(); // Telemetry
+            }
+
+            if (ImGui::BeginTabItem("Firmware Update")) {
+                FlashStatus fw = g_fw_updater.status();
+
+                ImGui::Text("Port: %s", port.c_str());
+                ImGui::Separator();
+
+                ImGui::InputTextWithHint("Firmware path", "path to .bin image...", g_fw_path, sizeof(g_fw_path));
+                ImGui::SameLine();
+                if (ImGui::Button("Flash") && g_fw_path[0] != '\0') {
+                    FlashJob job;
+                    job.firmware_path = g_fw_path;
+                    job.port = port;
+                    job.auto_gpio = g_fw_auto_gpio;
+                    if (!g_fw_updater.queueFlash(job, false)) {
+                        // already flashing - status will show it
+                    }
+                }
+
+                ImGui::Checkbox("Auto GPIO (MCP2221A)", &g_fw_auto_gpio);
+                if (!g_fw_auto_gpio) {
+                    ImGui::TextDisabled("Manual mode: hold BOOT0 HIGH, press RESET, then release BOOT0 after flashing.");
+                }
+
+                ImGui::Separator();
+
+                // HTTP server controls
+                ImGui::InputText("HTTP port", g_http_port, sizeof(g_http_port),
+                                 ImGuiInputTextFlags_CharsDecimal);
+                ImGui::SameLine();
+                if (g_http_server.isRunning()) {
+                    if (ImGui::Button("Stop Server")) {
+                        g_http_server.stop();
+                    }
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f),
+                                       "Running on http://localhost:%d/flash",
+                                       g_http_server.actualPort());
+                } else {
+                    if (ImGui::Button("Start Server")) {
+                        if (!g_http_server.restart(g_http_port)) {
+                            // Failed to start; status is reflected by isRunning().
+                        }
+                    }
+                }
+                ImGui::TextDisabled("POST the raw .bin body to /flash to queue a firmware update.");
+
+                ImGui::Separator();
+
+                // Status
+                ImVec4 state_color = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
+                if (fw.state == FlashState::Done) state_color = ImVec4(0.0f, 1.0f, 0.0f, 1.0f);
+                else if (fw.state == FlashState::Failed) state_color = ImVec4(1.0f, 0.0f, 0.0f, 1.0f);
+                else if (fw.busy) state_color = ImVec4(1.0f, 1.0f, 0.0f, 1.0f);
+                ImGui::TextColored(state_color, "State: %s", FirmwareUpdater::stateString(fw.state));
+                if (!fw.last_error.empty()) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f),
+                                       "Error: %s", fw.last_error.c_str());
+                }
+
+                ImGui::BeginChild("##fw_log", ImVec2(0, 0), true);
+                for (const auto& line : fw.log) {
+                    ImGui::TextWrapped("%s", line.c_str());
+                }
+                if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 5.0f) {
+                    ImGui::SetScrollHereY(1.0f);
+                }
+                ImGui::EndChild();
+
+                ImGui::EndTabItem(); // Firmware Update
+            }
+
+            ImGui::EndTabBar();
+        }
 
         ImGui::End(); // root
 
