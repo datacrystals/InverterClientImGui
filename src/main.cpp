@@ -20,9 +20,15 @@
 // ---------------- Command log only ----------------
 static std::deque<std::string> g_cmdlog;
 static size_t g_cmdlog_cap = 200;
+
+// Flattened console text for the selectable read-only text field
+static std::string g_cmdlog_buf;
+static bool        g_cmdlog_buf_dirty = true;
+
 static void cmdlog_push(const std::string& s) {
     g_cmdlog.push_back(s);
     while (g_cmdlog.size() > g_cmdlog_cap) g_cmdlog.pop_front();
+    g_cmdlog_buf_dirty = true;
 }
 // --- Telemetry console drain + autoscroll state ---
 static uint64_t g_last_console_seq = 0; // last consumed console seq
@@ -415,8 +421,11 @@ int main(int argc, char** argv) {
         if (ImGui::SmallButton("Clear")) {
     g_cmdlog.clear();
     g_cmdlog_new_lines = true;
+    g_cmdlog_buf_dirty = true;
     // Optional: do NOT reset g_last_console_n, so we don't re-add old telemetry lines.
 }
+        ImGui::SameLine();
+        ImGui::Checkbox("Autoscroll", &g_cmdlog_autoscroll);
         ImGui::SameLine();
         ImGui::TextUnformatted("Commands");
         ImGui::Separator();
@@ -429,27 +438,50 @@ int main(int argc, char** argv) {
         float log_h = ImGui::GetContentRegionAvail().y - input_row_h - spacing_y;
         log_h = std::max(20.0f, log_h);
 
-        // Log (top of console)
-ImGui::BeginChild("##cmdlog", ImVec2(0, log_h), false);
+        // Log (top of console) as a read-only multi-line text field
+        if (g_cmdlog_buf_dirty) {
+            g_cmdlog_buf.clear();
+            g_cmdlog_buf.reserve(g_cmdlog.size() * 64);
+            for (const auto& line : g_cmdlog) {
+                g_cmdlog_buf += line;
+                g_cmdlog_buf += '\n';
+            }
+            g_cmdlog_buf_dirty = false;
+        }
 
-// draw lines (wrap at window width so long strings are readable)
-for (auto& line : g_cmdlog) ImGui::TextWrapped("%s", line.c_str());
+        ImGui::BeginChild("##cmdlog", ImVec2(0, log_h), false);
 
-// Auto-scroll:
-// only scroll if user is already at/near bottom, so we don't fight manual scrolling
-if (g_cmdlog_autoscroll && g_cmdlog_new_lines) {
-    float maxY = ImGui::GetScrollMaxY();
-    float curY = ImGui::GetScrollY();
-    bool user_at_bottom = (maxY - curY) < 5.0f;
-    if (user_at_bottom) {
-        ImGui::SetScrollHereY(1.0f);
-    }
-}
+        // Size the text field to its wrapped content so the parent child window owns the scrollbar.
+        float wrap_width = ImMax(1.0f, ImGui::GetContentRegionAvail().x - ImGui::GetStyle().FramePadding.x * 2.0f);
+        ImVec2 text_size = ImGui::CalcTextSize(g_cmdlog_buf.c_str(),
+                                               g_cmdlog_buf.c_str() + g_cmdlog_buf.size(),
+                                               false,
+                                               wrap_width);
+        float content_h = text_size.y + ImGui::GetTextLineHeight() + ImGui::GetStyle().FramePadding.y * 2.0f;
+        float field_h = std::max(content_h, ImGui::GetContentRegionAvail().y);
 
-ImGui::EndChild();
+        ImGui::InputTextMultiline("##cmdlog_edit",
+                                  g_cmdlog_buf.data(),
+                                  g_cmdlog_buf.size() + 1,
+                                  ImVec2(-FLT_MIN, field_h),
+                                  ImGuiInputTextFlags_ReadOnly |
+                                  ImGuiInputTextFlags_WordWrap |
+                                  ImGuiInputTextFlags_NoHorizontalScroll);
 
-// reset new-lines flag once we've rendered
-g_cmdlog_new_lines = false;
+        // Auto-scroll: only scroll if user is already at/near bottom, so we don't fight manual scrolling
+        if (g_cmdlog_autoscroll && g_cmdlog_new_lines) {
+            float maxY = ImGui::GetScrollMaxY();
+            float curY = ImGui::GetScrollY();
+            bool user_at_bottom = (maxY - curY) < 5.0f;
+            if (user_at_bottom) {
+                ImGui::SetScrollHereY(1.0f);
+            }
+        }
+
+        ImGui::EndChild();
+
+        // reset new-lines flag once we've rendered
+        g_cmdlog_new_lines = false;
 
 
         // Input row pinned near bottom, with same padding as the rest
