@@ -34,8 +34,8 @@ static void cmdlog_push(const std::string& s) {
     // No hard cap: keep full scrollback history ("infinite scroll range").
     // For extreme long runs, memory is the practical limit.
     if (!g_cmdlog_buf_dirty) {
+        if (!g_cmdlog_buf.empty()) g_cmdlog_buf += '\n';
         g_cmdlog_buf += s;
-        g_cmdlog_buf += '\n';
     }
     g_cmdlog_new_lines = true;
 }
@@ -479,49 +479,43 @@ int main(int argc, char** argv) {
         log_h = std::max(20.0f, log_h);
 
         // Log (top of console) as a read-only multi-line text field.
+        // InputTextMultiline owns the single scrollbar; we autoscroll by locating
+        // its internal child window after it renders and setting its scroll directly.
         if (g_cmdlog_buf_dirty) {
             g_cmdlog_buf.clear();
             g_cmdlog_buf.reserve(g_cmdlog.size() * 64);
-            for (const auto& line : g_cmdlog) {
-                g_cmdlog_buf += line;
-                g_cmdlog_buf += '\n';
+            for (size_t i = 0; i < g_cmdlog.size(); ++i) {
+                if (i > 0) g_cmdlog_buf += '\n';
+                g_cmdlog_buf += g_cmdlog[i];
             }
             g_cmdlog_buf_dirty = false;
         }
 
-        ImGui::BeginChild("##cmdlog", ImVec2(0, log_h), false);
-
-        // Size the text field to its wrapped content so the parent child window
-        // owns the only scrollbar. Add one line of slack for the trailing newline
-        // / cursor row and to avoid any round-off from triggering a second bar.
-        float avail_x = ImGui::GetContentRegionAvail().x;
-        float wrap_width = ImMax(1.0f, avail_x - ImGui::GetStyle().ScrollbarSize);
-        ImVec2 text_size = ImGui::CalcTextSize(g_cmdlog_buf.c_str(),
-                                               g_cmdlog_buf.c_str() + g_cmdlog_buf.size(),
-                                               false,
-                                               wrap_width);
-        float content_h = text_size.y + ImGui::GetTextLineHeight() + ImGui::GetStyle().FramePadding.y * 2.0f;
-        float field_h = std::max(content_h, ImGui::GetContentRegionAvail().y);
+        ImGuiID cmdlog_edit_id = ImGui::GetCurrentWindow()->GetID("##cmdlog_edit");
 
         ImGui::InputTextMultiline("##cmdlog_edit",
                                   g_cmdlog_buf.data(),
                                   g_cmdlog_buf.size() + 1,
-                                  ImVec2(-FLT_MIN, field_h),
+                                  ImVec2(-FLT_MIN, log_h),
                                   ImGuiInputTextFlags_ReadOnly |
                                   ImGuiInputTextFlags_WordWrap |
                                   ImGuiInputTextFlags_NoHorizontalScroll);
 
-        // Auto-scroll: only scroll if user is already at/near bottom.
         if (g_cmdlog_autoscroll && g_cmdlog_new_lines) {
-            float maxY = ImGui::GetScrollMaxY();
-            float curY = ImGui::GetScrollY();
-            bool user_at_bottom = (maxY - curY) < 5.0f;
-            if (user_at_bottom) {
-                ImGui::SetScrollHereY(1.0f);
+            ImGuiWindow* parent = ImGui::GetCurrentWindow();
+            ImGuiWindow* cmdlog_win = nullptr;
+            for (int i = 0; i < parent->DC.ChildWindows.Size; ++i) {
+                if (parent->DC.ChildWindows[i]->ChildId == cmdlog_edit_id) {
+                    cmdlog_win = parent->DC.ChildWindows[i];
+                    break;
+                }
+            }
+            if (cmdlog_win && (cmdlog_win->ScrollMax.y - cmdlog_win->Scroll.y < 5.0f)) {
+                // Set scroll directly; next frame's Begin() will clamp it to the
+                // new ContentSize, landing exactly on the updated bottom.
+                cmdlog_win->Scroll.y = 1e9f;
             }
         }
-
-        ImGui::EndChild();
 
         // reset new-lines flag once we've rendered
         g_cmdlog_new_lines = false;
