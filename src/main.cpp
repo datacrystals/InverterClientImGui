@@ -19,21 +19,60 @@
 
 // ---------------- Command log only ----------------
 static std::deque<std::string> g_cmdlog;
-static size_t g_cmdlog_cap = 200;
 
 // Flattened console text for the selectable read-only text field
 static std::string g_cmdlog_buf;
 static bool        g_cmdlog_buf_dirty = true;
 
-static void cmdlog_push(const std::string& s) {
-    g_cmdlog.push_back(s);
-    while (g_cmdlog.size() > g_cmdlog_cap) g_cmdlog.pop_front();
-    g_cmdlog_buf_dirty = true;
-}
 // --- Telemetry console drain + autoscroll state ---
 static uint64_t g_last_console_seq = 0; // last consumed console seq
 static bool     g_cmdlog_new_lines = false;
 static bool     g_cmdlog_autoscroll = true;
+
+static void cmdlog_push(const std::string& s) {
+    g_cmdlog.push_back(s);
+    // No hard cap: keep full scrollback history ("infinite scroll range").
+    // For extreme long runs, memory is the practical limit.
+    if (!g_cmdlog_buf_dirty) {
+        g_cmdlog_buf += s;
+        g_cmdlog_buf += '\n';
+    }
+    g_cmdlog_new_lines = true;
+}
+
+// Command history for the input box (Up/Down cycling)
+static std::vector<std::string> g_cmd_history;
+static int                      g_cmd_history_pos = -1; // -1 = current edit, 0 = most recent, etc.
+static std::string              g_cmd_current;
+
+// Callback for the command input box: Up/Down cycles through command history.
+static int ConsoleInputCallback(ImGuiInputTextCallbackData* data) {
+    if (data->EventFlag == ImGuiInputTextFlags_CallbackHistory && !g_cmd_history.empty()) {
+        if (data->EventKey == ImGuiKey_UpArrow) {
+            if (g_cmd_history_pos < (int)g_cmd_history.size() - 1) {
+                if (g_cmd_history_pos == -1) {
+                    g_cmd_current.assign(data->Buf, (size_t)data->BufTextLen);
+                }
+                g_cmd_history_pos++;
+                const std::string& cmd = g_cmd_history[g_cmd_history.size() - 1 - g_cmd_history_pos];
+                data->DeleteChars(0, data->BufTextLen);
+                data->InsertChars(0, cmd.c_str());
+            }
+        } else if (data->EventKey == ImGuiKey_DownArrow) {
+            if (g_cmd_history_pos > -1) {
+                g_cmd_history_pos--;
+                data->DeleteChars(0, data->BufTextLen);
+                if (g_cmd_history_pos == -1) {
+                    data->InsertChars(0, g_cmd_current.c_str());
+                } else {
+                    const std::string& cmd = g_cmd_history[g_cmd_history.size() - 1 - g_cmd_history_pos];
+                    data->InsertChars(0, cmd.c_str());
+                }
+            }
+        }
+    }
+    return 0;
+}
 
 // Three independent plot sets
 static std::unordered_set<std::string> g_plot_set[3];
@@ -420,8 +459,9 @@ int main(int argc, char** argv) {
         // Header row
         if (ImGui::SmallButton("Clear")) {
     g_cmdlog.clear();
+    g_cmdlog_buf.clear();
     g_cmdlog_new_lines = true;
-    g_cmdlog_buf_dirty = true;
+    g_cmdlog_buf_dirty = false;
     // Optional: do NOT reset g_last_console_n, so we don't re-add old telemetry lines.
 }
         ImGui::SameLine();
@@ -438,7 +478,7 @@ int main(int argc, char** argv) {
         float log_h = ImGui::GetContentRegionAvail().y - input_row_h - spacing_y;
         log_h = std::max(20.0f, log_h);
 
-        // Log (top of console) as a read-only multi-line text field
+        // Log (top of console) as a read-only multi-line text field.
         if (g_cmdlog_buf_dirty) {
             g_cmdlog_buf.clear();
             g_cmdlog_buf.reserve(g_cmdlog.size() * 64);
@@ -451,8 +491,11 @@ int main(int argc, char** argv) {
 
         ImGui::BeginChild("##cmdlog", ImVec2(0, log_h), false);
 
-        // Size the text field to its wrapped content so the parent child window owns the scrollbar.
-        float wrap_width = ImMax(1.0f, ImGui::GetContentRegionAvail().x - ImGui::GetStyle().FramePadding.x * 2.0f);
+        // Size the text field to its wrapped content so the parent child window
+        // owns the only scrollbar. Add one line of slack for the trailing newline
+        // / cursor row and to avoid any round-off from triggering a second bar.
+        float avail_x = ImGui::GetContentRegionAvail().x;
+        float wrap_width = ImMax(1.0f, avail_x - ImGui::GetStyle().ScrollbarSize);
         ImVec2 text_size = ImGui::CalcTextSize(g_cmdlog_buf.c_str(),
                                                g_cmdlog_buf.c_str() + g_cmdlog_buf.size(),
                                                false,
@@ -468,7 +511,7 @@ int main(int argc, char** argv) {
                                   ImGuiInputTextFlags_WordWrap |
                                   ImGuiInputTextFlags_NoHorizontalScroll);
 
-        // Auto-scroll: only scroll if user is already at/near bottom, so we don't fight manual scrolling
+        // Auto-scroll: only scroll if user is already at/near bottom.
         if (g_cmdlog_autoscroll && g_cmdlog_new_lines) {
             float maxY = ImGui::GetScrollMaxY();
             float curY = ImGui::GetScrollY();
@@ -496,7 +539,10 @@ int main(int argc, char** argv) {
 
         // Input width fills remaining, button fixed
         ImGui::SetNextItemWidth(-60.0f);
-        bool enter = ImGui::InputText("##cmd", cmd_buf, sizeof(cmd_buf), ImGuiInputTextFlags_EnterReturnsTrue);
+        bool enter = ImGui::InputText("##cmd", cmd_buf, sizeof(cmd_buf),
+                                      ImGuiInputTextFlags_EnterReturnsTrue |
+                                      ImGuiInputTextFlags_CallbackHistory,
+                                      ConsoleInputCallback);
         ImGui::SameLine();
         bool clicked = ImGui::SmallButton("Send");
 
@@ -506,7 +552,14 @@ int main(int argc, char** argv) {
                 bool ok = client.sendLine(cmd);
                 cmdlog_push(std::string("> ") + cmd);
                 cmdlog_push(ok ? "  (sent)" : "  (FAILED to send)");
-                g_cmdlog_new_lines = true;
+
+                // Add to command history (deduplicate against the most recent entry).
+                if (g_cmd_history.empty() || g_cmd_history.back() != cmd) {
+                    g_cmd_history.push_back(cmd);
+                }
+                g_cmd_history_pos = -1;
+                g_cmd_current.clear();
+
                 cmd_buf[0] = 0;
             }
             focus_cmd = true;
