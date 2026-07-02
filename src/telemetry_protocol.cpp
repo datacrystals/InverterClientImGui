@@ -213,6 +213,24 @@ void TelemetryClient::stop() {
     serial_.close();
 }
 
+void TelemetryClient::suspend() {
+    suspended_.store(true);
+    {
+        std::lock_guard<std::mutex> lk(serial_mtx_);
+        serial_.close();
+    }
+    // Give the reader thread time to see the close and back off.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+}
+
+void TelemetryClient::resume() {
+    suspended_.store(false);
+}
+
+bool TelemetryClient::isSuspended() const {
+    return suspended_.load();
+}
+
 TelemetryState TelemetryClient::snapshot() const {
     std::lock_guard<std::mutex> lk(mtx_);
     return st_;
@@ -455,6 +473,11 @@ void TelemetryClient::threadMain(const std::string& port) {
     };
 
     while (run_.load()) {
+        if (suspended_.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+
         {
             auto now = std::chrono::steady_clock::now();
             if (now - last_good_frame > std::chrono::seconds(2)) {

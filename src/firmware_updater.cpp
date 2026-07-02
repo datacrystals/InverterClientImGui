@@ -91,6 +91,11 @@ std::string FirmwareUpdater::currentPort() const {
     return current_port_;
 }
 
+void FirmwareUpdater::setSuspendCallback(std::function<void(bool)> cb) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    suspend_cb_ = std::move(cb);
+}
+
 void FirmwareUpdater::setState(FlashState s) {
     {
         std::lock_guard<std::mutex> lk(mtx_);
@@ -243,6 +248,26 @@ bool FirmwareUpdater::gpioCommand(const std::string& helper, const std::string& 
     return runCommand(cmd, std::string("GPIO ") + arg);
 }
 
+static void call_suspend_cb(const std::function<void(bool)>& cb, bool suspend) {
+    if (cb) {
+        try {
+            cb(suspend);
+        } catch (...) {
+            // ignore callback errors; flash can still proceed
+        }
+    }
+}
+
+struct SuspendGuard {
+    std::function<void(bool)> cb;
+    explicit SuspendGuard(std::function<void(bool)> cb_) : cb(std::move(cb_)) {
+        call_suspend_cb(cb, true);
+    }
+    ~SuspendGuard() { call_suspend_cb(cb, false); }
+    SuspendGuard(const SuspendGuard&) = delete;
+    SuspendGuard& operator=(const SuspendGuard&) = delete;
+};
+
 void FirmwareUpdater::runJob(const FlashJob& job) {
     {
         std::lock_guard<std::mutex> lk(mtx_);
@@ -251,6 +276,9 @@ void FirmwareUpdater::runJob(const FlashJob& job) {
         log_.clear();
         state_ = FlashState::Idle;
     }
+
+    logLine("[telemetry] Suspending telemetry reader to free serial port");
+    SuspendGuard sg(suspend_cb_);
 
     logLine("==================================================");
     logLine(" Firmware update started");
