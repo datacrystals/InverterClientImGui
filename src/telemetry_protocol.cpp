@@ -438,12 +438,17 @@ void TelemetryClient::threadMain(const std::string& port) {
     uint64_t frames_in_window = 0;
     auto hz_window_start = t0;
 
+    uint64_t bytes_in_window = 0;
+    auto bytes_window_start = t0;
+
     auto last_good_frame = std::chrono::steady_clock::now();
 
     auto reset_parser = [&]() {
         frame.clear();
         frames_in_window = 0;
         hz_window_start = std::chrono::steady_clock::now();
+        bytes_in_window = 0;
+        bytes_window_start = std::chrono::steady_clock::now();
         last_good_frame = std::chrono::steady_clock::now();
     };
 
@@ -465,6 +470,7 @@ void TelemetryClient::threadMain(const std::string& port) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
+        bytes_in_window += (uint64_t)n;
 
         for (int i = 0; i < n; ++i) {
             uint8_t b = buf[i];
@@ -539,10 +545,14 @@ void TelemetryClient::threadMain(const std::string& port) {
                         float dt = std::chrono::duration<float>(now - hz_window_start).count();
                         if (dt >= 1.0f) {
                             float hz = frames_in_window / dt;
+                            float bytes_per_sec = bytes_in_window / dt;
                             std::lock_guard<std::mutex> lk(mtx_);
                             st_.rx_hz = hz;
+                            st_.rx_bytes_per_sec = bytes_per_sec;
                             frames_in_window = 0;
                             hz_window_start = now;
+                            bytes_in_window = 0;
+                            bytes_window_start = now;
                         }
                     } catch (...) {
                         // keep going; bad frames happen during reconnect/startup

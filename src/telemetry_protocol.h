@@ -18,6 +18,7 @@
 
 static constexpr uint32_t MAGIC   = 0x544C4D31u; // "TLM1"
 static constexpr uint8_t  VERSION = 1;
+static constexpr int      BAUD_RATE = 460800;     // fixed serial baud
 
 enum MsgType : uint8_t {
     MSG_DATA   = 1,
@@ -67,6 +68,7 @@ struct TelemetryState {
 
     uint32_t last_seq = 0;
     float rx_hz = 0.0f;
+    float rx_bytes_per_sec = 0.0f;
     uint64_t good_frames = 0;
     uint64_t bad_frames  = 0;
 

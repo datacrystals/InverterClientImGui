@@ -293,8 +293,9 @@ int main(int argc, char** argv) {
         ImGui::Begin("##RTE_ROOT", nullptr, flags);
 
         // header
-       ImGui::Text("Port: %s | RX: %.1f Hz | Seq: %u | Good: %llu | Bad: %llu | Reject: crc=%llu hdr=%llu len=%llu parse=%llu unknown_id=%llu",
-    port.c_str(), st.rx_hz, st.last_seq,
+        float bandwidth_pct = st.rx_bytes_per_sec * 10.0f / (float)BAUD_RATE * 100.0f;
+        ImGui::Text("Port: %s | RX: %.1f Hz | Bandwidth: %.1f%% | Seq: %u | Good: %llu | Bad: %llu | Reject: crc=%llu hdr=%llu len=%llu parse=%llu unknown_id=%llu",
+    port.c_str(), st.rx_hz, bandwidth_pct, st.last_seq,
     (unsigned long long)st.good_frames,
     (unsigned long long)st.bad_frames,
     (unsigned long long)st.reject_crc,
