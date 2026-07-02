@@ -127,12 +127,14 @@ cfmakeraw(&tty);
 
 tty.c_cflag |= (CLOCAL | CREAD);
 tty.c_cflag &= ~CRTSCTS;
+tty.c_cflag &= ~HUPCL;          // Don't drop DTR on close (avoid device reset on reconnect)
 tty.c_cc[VMIN]  = 0;
 tty.c_cc[VTIME] = 1;
 
 if (tcsetattr(fd, TCSANOW, &tty) != 0) { ::close(fd); return false; }
 
-tcflush(fd, TCIFLUSH);
+// Flush any stale data in both directions before use.
+tcflush(fd, TCIOFLUSH);
 h_ = fd;
 return true;
 #endif
