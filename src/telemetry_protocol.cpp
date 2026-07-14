@@ -127,12 +127,14 @@ cfmakeraw(&tty);
 
 tty.c_cflag |= (CLOCAL | CREAD);
 tty.c_cflag &= ~CRTSCTS;
+tty.c_cflag &= ~HUPCL;          // Don't drop DTR on close (avoid device reset on reconnect)
 tty.c_cc[VMIN]  = 0;
 tty.c_cc[VTIME] = 1;
 
 if (tcsetattr(fd, TCSANOW, &tty) != 0) { ::close(fd); return false; }
 
-tcflush(fd, TCIFLUSH);
+// Flush any stale data in both directions before use.
+tcflush(fd, TCIOFLUSH);
 h_ = fd;
 return true;
 #endif
@@ -209,6 +211,24 @@ void TelemetryClient::stop() {
     }
     std::lock_guard<std::mutex> lk(serial_mtx_);
     serial_.close();
+}
+
+void TelemetryClient::suspend() {
+    suspended_.store(true);
+    {
+        std::lock_guard<std::mutex> lk(serial_mtx_);
+        serial_.close();
+    }
+    // Give the reader thread time to see the close and back off.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+}
+
+void TelemetryClient::resume() {
+    suspended_.store(false);
+}
+
+bool TelemetryClient::isSuspended() const {
+    return suspended_.load();
 }
 
 TelemetryState TelemetryClient::snapshot() const {
@@ -438,16 +458,26 @@ void TelemetryClient::threadMain(const std::string& port) {
     uint64_t frames_in_window = 0;
     auto hz_window_start = t0;
 
+    uint64_t bytes_in_window = 0;
+    auto bytes_window_start = t0;
+
     auto last_good_frame = std::chrono::steady_clock::now();
 
     auto reset_parser = [&]() {
         frame.clear();
         frames_in_window = 0;
         hz_window_start = std::chrono::steady_clock::now();
+        bytes_in_window = 0;
+        bytes_window_start = std::chrono::steady_clock::now();
         last_good_frame = std::chrono::steady_clock::now();
     };
 
     while (run_.load()) {
+        if (suspended_.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+
         {
             auto now = std::chrono::steady_clock::now();
             if (now - last_good_frame > std::chrono::seconds(2)) {
@@ -465,6 +495,7 @@ void TelemetryClient::threadMain(const std::string& port) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
+        bytes_in_window += (uint64_t)n;
 
         for (int i = 0; i < n; ++i) {
             uint8_t b = buf[i];
@@ -539,10 +570,14 @@ void TelemetryClient::threadMain(const std::string& port) {
                         float dt = std::chrono::duration<float>(now - hz_window_start).count();
                         if (dt >= 1.0f) {
                             float hz = frames_in_window / dt;
+                            float bytes_per_sec = bytes_in_window / dt;
                             std::lock_guard<std::mutex> lk(mtx_);
                             st_.rx_hz = hz;
+                            st_.rx_bytes_per_sec = bytes_per_sec;
                             frames_in_window = 0;
                             hz_window_start = now;
+                            bytes_in_window = 0;
+                            bytes_window_start = now;
                         }
                     } catch (...) {
                         // keep going; bad frames happen during reconnect/startup

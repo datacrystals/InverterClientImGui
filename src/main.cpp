@@ -14,18 +14,65 @@
 #include "implot.h"
 #include "telemetry_protocol.h"
 #include "config_manager.h"
+#include "firmware_updater.h"
+#include "http_server.h"
 
 // ---------------- Command log only ----------------
 static std::deque<std::string> g_cmdlog;
-static size_t g_cmdlog_cap = 200;
-static void cmdlog_push(const std::string& s) {
-    g_cmdlog.push_back(s);
-    while (g_cmdlog.size() > g_cmdlog_cap) g_cmdlog.pop_front();
-}
+
+// Flattened console text for the selectable read-only text field
+static std::string g_cmdlog_buf;
+static bool        g_cmdlog_buf_dirty = true;
+
 // --- Telemetry console drain + autoscroll state ---
 static uint64_t g_last_console_seq = 0; // last consumed console seq
 static bool     g_cmdlog_new_lines = false;
 static bool     g_cmdlog_autoscroll = true;
+
+static void cmdlog_push(const std::string& s) {
+    g_cmdlog.push_back(s);
+    // No hard cap: keep full scrollback history ("infinite scroll range").
+    // For extreme long runs, memory is the practical limit.
+    if (!g_cmdlog_buf_dirty) {
+        if (!g_cmdlog_buf.empty()) g_cmdlog_buf += '\n';
+        g_cmdlog_buf += s;
+    }
+    g_cmdlog_new_lines = true;
+}
+
+// Command history for the input box (Up/Down cycling)
+static std::vector<std::string> g_cmd_history;
+static int                      g_cmd_history_pos = -1; // -1 = current edit, 0 = most recent, etc.
+static std::string              g_cmd_current;
+
+// Callback for the command input box: Up/Down cycles through command history.
+static int ConsoleInputCallback(ImGuiInputTextCallbackData* data) {
+    if (data->EventFlag == ImGuiInputTextFlags_CallbackHistory && !g_cmd_history.empty()) {
+        if (data->EventKey == ImGuiKey_UpArrow) {
+            if (g_cmd_history_pos < (int)g_cmd_history.size() - 1) {
+                if (g_cmd_history_pos == -1) {
+                    g_cmd_current.assign(data->Buf, (size_t)data->BufTextLen);
+                }
+                g_cmd_history_pos++;
+                const std::string& cmd = g_cmd_history[g_cmd_history.size() - 1 - g_cmd_history_pos];
+                data->DeleteChars(0, data->BufTextLen);
+                data->InsertChars(0, cmd.c_str());
+            }
+        } else if (data->EventKey == ImGuiKey_DownArrow) {
+            if (g_cmd_history_pos > -1) {
+                g_cmd_history_pos--;
+                data->DeleteChars(0, data->BufTextLen);
+                if (g_cmd_history_pos == -1) {
+                    data->InsertChars(0, g_cmd_current.c_str());
+                } else {
+                    const std::string& cmd = g_cmd_history[g_cmd_history.size() - 1 - g_cmd_history_pos];
+                    data->InsertChars(0, cmd.c_str());
+                }
+            }
+        }
+    }
+    return 0;
+}
 
 // Three independent plot sets
 static std::unordered_set<std::string> g_plot_set[3];
@@ -34,6 +81,13 @@ static std::unordered_set<std::string> g_plot_set[3];
 static ConfigManager g_cfg_mgr;
 static char g_cfg_name[128] = {0};
 static std::string g_cfg_status;
+
+// Firmware update state
+static FirmwareUpdater g_fw_updater;
+static HttpFlashServer g_http_server(g_fw_updater, "18080");
+static char g_fw_path[512] = {0};
+static char g_http_port[16] = "18080";
+static bool g_fw_auto_gpio = true;
 
 static const char* GuessYLabel(const std::string& name) {
     if (name.rfind("V_", 0) == 0) return "Volts (V)";
@@ -163,6 +217,16 @@ int main(int argc, char** argv) {
 
     TelemetryClient client;
     client.start(port);
+    g_fw_updater.setCurrentPort(port);
+    g_fw_updater.setSuspendCallback([&client](bool suspend) {
+        if (suspend) client.suspend();
+        else         client.resume();
+    });
+
+    // Auto-start the HTTP firmware-update server on localhost.
+    if (!g_http_server.start()) {
+        fprintf(stderr, "[WARN] Failed to auto-start HTTP firmware server on port %s\n", g_http_port);
+    }
 
     // Prefer native Wayland: under XWayland the compositor upscales the whole
     // window AND GLFW reports that same scale, so applying it in ImGui would
@@ -259,8 +323,9 @@ int main(int argc, char** argv) {
         ImGui::Begin("##RTE_ROOT", nullptr, flags);
 
         // header
-       ImGui::Text("Port: %s | RX: %.1f Hz | Seq: %u | Good: %llu | Bad: %llu | Reject: crc=%llu hdr=%llu len=%llu parse=%llu unknown_id=%llu",
-    port.c_str(), st.rx_hz, st.last_seq,
+        float bandwidth_pct = st.rx_bytes_per_sec * 10.0f / (float)BAUD_RATE * 100.0f;
+        ImGui::Text("Port: %s | RX: %.1f Hz | Bandwidth: %.1f%% | Seq: %u | Good: %llu | Bad: %llu | Reject: crc=%llu hdr=%llu len=%llu parse=%llu unknown_id=%llu",
+    port.c_str(), st.rx_hz, bandwidth_pct, st.last_seq,
     (unsigned long long)st.good_frames,
     (unsigned long long)st.bad_frames,
     (unsigned long long)st.reject_crc,
@@ -330,6 +395,9 @@ int main(int argc, char** argv) {
         }
 
         ImGui::Separator();
+
+        if (ImGui::BeginTabBar("##main_tabs", ImGuiTabBarFlags_None)) {
+            if (ImGui::BeginTabItem("Telemetry")) {
 
         // --- main split: selection vs graphs ---
         ImVec2 avail = ImGui::GetContentRegionAvail();
@@ -422,9 +490,13 @@ int main(int argc, char** argv) {
         // Header row
         if (ImGui::SmallButton("Clear")) {
     g_cmdlog.clear();
+    g_cmdlog_buf.clear();
     g_cmdlog_new_lines = true;
+    g_cmdlog_buf_dirty = false;
     // Optional: do NOT reset g_last_console_n, so we don't re-add old telemetry lines.
 }
+        ImGui::SameLine();
+        ImGui::Checkbox("Autoscroll", &g_cmdlog_autoscroll);
         ImGui::SameLine();
         ImGui::TextUnformatted("Commands");
         ImGui::Separator();
@@ -437,27 +509,47 @@ int main(int argc, char** argv) {
         float log_h = ImGui::GetContentRegionAvail().y - input_row_h - spacing_y;
         log_h = std::max(20.0f, log_h);
 
-        // Log (top of console)
-ImGui::BeginChild("##cmdlog", ImVec2(0, log_h), false);
+        // Log (top of console) as a read-only multi-line text field.
+        // InputTextMultiline owns the single scrollbar; we autoscroll by locating
+        // its internal child window after it renders and setting its scroll directly.
+        if (g_cmdlog_buf_dirty) {
+            g_cmdlog_buf.clear();
+            g_cmdlog_buf.reserve(g_cmdlog.size() * 64);
+            for (size_t i = 0; i < g_cmdlog.size(); ++i) {
+                if (i > 0) g_cmdlog_buf += '\n';
+                g_cmdlog_buf += g_cmdlog[i];
+            }
+            g_cmdlog_buf_dirty = false;
+        }
 
-// draw lines (wrap at window width so long strings are readable)
-for (auto& line : g_cmdlog) ImGui::TextWrapped("%s", line.c_str());
+        ImGuiID cmdlog_edit_id = ImGui::GetCurrentWindow()->GetID("##cmdlog_edit");
 
-// Auto-scroll:
-// only scroll if user is already at/near bottom, so we don't fight manual scrolling
-if (g_cmdlog_autoscroll && g_cmdlog_new_lines) {
-    float maxY = ImGui::GetScrollMaxY();
-    float curY = ImGui::GetScrollY();
-    bool user_at_bottom = (maxY - curY) < 5.0f;
-    if (user_at_bottom) {
-        ImGui::SetScrollHereY(1.0f);
-    }
-}
+        ImGui::InputTextMultiline("##cmdlog_edit",
+                                  g_cmdlog_buf.data(),
+                                  g_cmdlog_buf.size() + 1,
+                                  ImVec2(-FLT_MIN, log_h),
+                                  ImGuiInputTextFlags_ReadOnly |
+                                  ImGuiInputTextFlags_WordWrap |
+                                  ImGuiInputTextFlags_NoHorizontalScroll);
 
-ImGui::EndChild();
+        if (g_cmdlog_autoscroll && g_cmdlog_new_lines) {
+            ImGuiWindow* parent = ImGui::GetCurrentWindow();
+            ImGuiWindow* cmdlog_win = nullptr;
+            for (int i = 0; i < parent->DC.ChildWindows.Size; ++i) {
+                if (parent->DC.ChildWindows[i]->ChildId == cmdlog_edit_id) {
+                    cmdlog_win = parent->DC.ChildWindows[i];
+                    break;
+                }
+            }
+            if (cmdlog_win && (cmdlog_win->ScrollMax.y - cmdlog_win->Scroll.y < 5.0f)) {
+                // Set scroll directly; next frame's Begin() will clamp it to the
+                // new ContentSize, landing exactly on the updated bottom.
+                cmdlog_win->Scroll.y = 1e9f;
+            }
+        }
 
-// reset new-lines flag once we've rendered
-g_cmdlog_new_lines = false;
+        // reset new-lines flag once we've rendered
+        g_cmdlog_new_lines = false;
 
 
         // Input row pinned near bottom, with same padding as the rest
@@ -472,7 +564,10 @@ g_cmdlog_new_lines = false;
 
         // Input width fills remaining, button fixed
         ImGui::SetNextItemWidth(-60.0f);
-        bool enter = ImGui::InputText("##cmd", cmd_buf, sizeof(cmd_buf), ImGuiInputTextFlags_EnterReturnsTrue);
+        bool enter = ImGui::InputText("##cmd", cmd_buf, sizeof(cmd_buf),
+                                      ImGuiInputTextFlags_EnterReturnsTrue |
+                                      ImGuiInputTextFlags_CallbackHistory,
+                                      ConsoleInputCallback);
         ImGui::SameLine();
         bool clicked = ImGui::SmallButton("Send");
 
@@ -482,7 +577,14 @@ g_cmdlog_new_lines = false;
                 bool ok = client.sendLine(cmd);
                 cmdlog_push(std::string("> ") + cmd);
                 cmdlog_push(ok ? "  (sent)" : "  (FAILED to send)");
-                g_cmdlog_new_lines = true;
+
+                // Add to command history (deduplicate against the most recent entry).
+                if (g_cmd_history.empty() || g_cmd_history.back() != cmd) {
+                    g_cmd_history.push_back(cmd);
+                }
+                g_cmd_history_pos = -1;
+                g_cmd_current.clear();
+
                 cmd_buf[0] = 0;
             }
             focus_cmd = true;
@@ -543,6 +645,83 @@ g_cmdlog_new_lines = false;
         PlotSet("##telemetry_plot_3", st, g_plot_set[2], view_seconds, g3_h);
 
         ImGui::EndChild(); // right
+
+                ImGui::EndTabItem(); // Telemetry
+            }
+
+            if (ImGui::BeginTabItem("Firmware Update")) {
+                FlashStatus fw = g_fw_updater.status();
+
+                ImGui::Text("Port: %s", port.c_str());
+                ImGui::Separator();
+
+                ImGui::InputTextWithHint("Firmware path", "path to .bin image...", g_fw_path, sizeof(g_fw_path));
+                ImGui::SameLine();
+                if (ImGui::Button("Flash") && g_fw_path[0] != '\0') {
+                    FlashJob job;
+                    job.firmware_path = g_fw_path;
+                    job.port = port;
+                    job.auto_gpio = g_fw_auto_gpio;
+                    if (!g_fw_updater.queueFlash(job, false)) {
+                        // already flashing - status will show it
+                    }
+                }
+
+                ImGui::Checkbox("Auto GPIO (MCP2221A)", &g_fw_auto_gpio);
+                if (!g_fw_auto_gpio) {
+                    ImGui::TextDisabled("Manual mode: hold BOOT0 HIGH, press RESET, then release BOOT0 after flashing.");
+                }
+
+                ImGui::Separator();
+
+                // HTTP server controls
+                ImGui::InputText("HTTP port", g_http_port, sizeof(g_http_port),
+                                 ImGuiInputTextFlags_CharsDecimal);
+                ImGui::SameLine();
+                if (g_http_server.isRunning()) {
+                    if (ImGui::Button("Stop Server")) {
+                        g_http_server.stop();
+                    }
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f),
+                                       "Running on http://localhost:%d/flash",
+                                       g_http_server.actualPort());
+                } else {
+                    if (ImGui::Button("Start Server")) {
+                        if (!g_http_server.restart(g_http_port)) {
+                            // Failed to start; status is reflected by isRunning().
+                        }
+                    }
+                }
+                ImGui::TextDisabled("POST the raw .bin body to /flash to queue a firmware update.");
+
+                ImGui::Separator();
+
+                // Status
+                ImVec4 state_color = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
+                if (fw.state == FlashState::Done) state_color = ImVec4(0.0f, 1.0f, 0.0f, 1.0f);
+                else if (fw.state == FlashState::Failed) state_color = ImVec4(1.0f, 0.0f, 0.0f, 1.0f);
+                else if (fw.busy) state_color = ImVec4(1.0f, 1.0f, 0.0f, 1.0f);
+                ImGui::TextColored(state_color, "State: %s", FirmwareUpdater::stateString(fw.state));
+                if (!fw.last_error.empty()) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f),
+                                       "Error: %s", fw.last_error.c_str());
+                }
+
+                ImGui::BeginChild("##fw_log", ImVec2(0, 0), true);
+                for (const auto& line : fw.log) {
+                    ImGui::TextWrapped("%s", line.c_str());
+                }
+                if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 5.0f) {
+                    ImGui::SetScrollHereY(1.0f);
+                }
+                ImGui::EndChild();
+
+                ImGui::EndTabItem(); // Firmware Update
+            }
+
+            ImGui::EndTabBar();
+        }
 
         ImGui::End(); // root
 

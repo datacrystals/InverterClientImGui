@@ -39,6 +39,8 @@ add_executable(imgui_api_viewer
   src/main.cpp
   src/telemetry_protocol.cpp
   src/config_manager.cpp
+  src/firmware_updater.cpp
+  src/http_server.cpp
   ${IMGUI_SOURCES}
   ${IMPLOT_SOURCES}
 )
@@ -74,7 +76,7 @@ if (APPLE)
 endif()
 
 if (WIN32)
-  target_link_libraries(imgui_api_viewer PRIVATE opengl32)
+  target_link_libraries(imgui_api_viewer PRIVATE opengl32 ws2_32)
 endif()
 
 if (IMGUI_API_VIEWER_WARNINGS)

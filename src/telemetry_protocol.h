@@ -18,6 +18,7 @@
 
 static constexpr uint32_t MAGIC   = 0x544C4D31u; // "TLM1"
 static constexpr uint8_t  VERSION = 1;
+static constexpr int      BAUD_RATE = 460800;     // fixed serial baud
 
 enum MsgType : uint8_t {
     MSG_DATA   = 1,
@@ -67,6 +68,7 @@ struct TelemetryState {
 
     uint32_t last_seq = 0;
     float rx_hz = 0.0f;
+    float rx_bytes_per_sec = 0.0f;
     uint64_t good_frames = 0;
     uint64_t bad_frames  = 0;
 
@@ -101,6 +103,9 @@ class TelemetryClient {
 public:
     bool start(const std::string& port);
     void stop();
+    void suspend();
+    void resume();
+    bool isSuspended() const;
 
     TelemetryState snapshot() const;
     void ingestStrLocked(const std::string& key, const std::string& v);
@@ -141,6 +146,7 @@ void parseDataPayloadLocked_(const uint8_t* payload, size_t len, float tsec);
     std::unordered_map<std::string, PartialString> partial_str_;
 
     std::atomic<bool> run_{false};
+    std::atomic<bool> suspended_{false};
     std::atomic<float> retain_seconds_{30.0f};
     std::atomic<int>   max_samples_{12000};
 
