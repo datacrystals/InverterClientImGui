@@ -164,7 +164,14 @@ int main(int argc, char** argv) {
     TelemetryClient client;
     client.start(port);
 
-    if (!glfwInit()) return 1;
+    // Prefer native Wayland: under XWayland the compositor upscales the whole
+    // window AND GLFW reports that same scale, so applying it in ImGui would
+    // double-scale everything. Fall back to any platform (X11) if unavailable.
+    glfwInitHint(GLFW_PLATFORM, GLFW_PLATFORM_WAYLAND);
+    if (!glfwInit()) {
+        glfwInitHint(GLFW_PLATFORM, GLFW_ANY_PLATFORM);
+        if (!glfwInit()) return 1;
+    }
     const char* glsl_version = "#version 130";
     //glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     //glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
@@ -174,11 +181,30 @@ int main(int argc, char** argv) {
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
 
+    {
+        int win_w, win_h, fb_w, fb_h;
+        glfwGetWindowSize(window, &win_w, &win_h);
+        glfwGetFramebufferSize(window, &fb_w, &fb_h);
+        fprintf(stderr, "GLFW platform: %s | window %dx%d | framebuffer %dx%d\n",
+                glfwGetPlatform() == GLFW_PLATFORM_WAYLAND ? "wayland" :
+                glfwGetPlatform() == GLFW_PLATFORM_X11     ? "x11" : "other",
+                win_w, win_h, fb_w, fb_h);
+    }
+
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImPlot::CreateContext();
 
     ImGui::StyleColorsDark();
+
+    // The built-in ProggyClean is a pixel font and smears badly under Wayland
+    // fractional scaling; a normally-antialiased TTF holds up much better.
+    {
+        ImGuiIO& io = ImGui::GetIO();
+        if (!io.Fonts->AddFontFromFileTTF("external/imgui/misc/fonts/Roboto-Medium.ttf", 13.0f))
+            io.Fonts->AddFontFromFileTTF("../external/imgui/misc/fonts/Roboto-Medium.ttf", 13.0f);
+    }
+
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init(glsl_version);
 
