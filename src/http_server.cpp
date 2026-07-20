@@ -1,4 +1,5 @@
 #include "http_server.h"
+#include "json_escape.h"
 
 #include <algorithm>
 #include <chrono>
@@ -6,6 +7,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <sstream>
 
 namespace fs = std::filesystem;
@@ -85,34 +87,64 @@ static void sendResponse(socket_t client, int code, const std::string& body) {
 #endif
 }
 
-static std::string jsonEscape(const std::string& s) {
+// Build {"lines":[{"seq":N,"text":"..."}...],"latest_seq":M} from the console
+// buffer: lines with seq > since, capped to the last max_lines of them.
+static std::string consoleToJson(const TelemetryState& st, uint64_t since, size_t max_lines) {
+    std::vector<const ConsoleLine*> sel;
+    for (const auto& ln : st.console) {
+        if (ln.seq > since) sel.push_back(&ln);
+    }
+    if (sel.size() > max_lines) sel.erase(sel.begin(), sel.end() - max_lines);
+
+    std::string resp = "{\"lines\":[";
+    bool first = true;
+    for (const ConsoleLine* ln : sel) {
+        resp += first ? "{\"seq\":" : ",{\"seq\":";
+        resp += std::to_string(ln->seq) + ",\"text\":\"" + jsonEscape(ln->text) + "\"}";
+        first = false;
+    }
+    resp += "],\"latest_seq\":"
+        + std::to_string(st.console.empty() ? 0 : st.console.back().seq) + "}";
+    return resp;
+}
+
+// Accept {"cmd":"..."} (naive extraction) or a raw command line as the body.
+static std::string extractCommand(const std::string& body) {
+    size_t start = body.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) return "";
+    if (body[start] != '{') {
+        size_t end = body.find_last_not_of(" \t\r\n");
+        return body.substr(start, end - start + 1);
+    }
+    size_t k = body.find("\"cmd\"");
+    if (k == std::string::npos) return "";
+    k = body.find(':', k + 5);
+    if (k == std::string::npos) return "";
+    k = body.find('"', k + 1);
+    if (k == std::string::npos) return "";
     std::string out;
-    out.reserve(s.size() + 2);
-    for (char c : s) {
-        switch (c) {
-            case '"': out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\b': out += "\\b"; break;
-            case '\f': out += "\\f"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default:
-                if ((unsigned char)c < 0x20) {
-                    char esc[8];
-                    snprintf(esc, sizeof(esc), "\\u%04x", c);
-                    out += esc;
-                } else {
-                    out += c;
-                }
-                break;
+    for (size_t i = k + 1; i < body.size(); ++i) {
+        char c = body[i];
+        if (c == '\\' && i + 1 < body.size()) {
+            char e = body[++i];
+            switch (e) {
+                case 'n': out += '\n'; break;
+                case 'r': out += '\r'; break;
+                case 't': out += '\t'; break;
+                default: out += e; break;
+            }
+        } else if (c == '"') {
+            break;
+        } else {
+            out += c;
         }
     }
     return out;
 }
 
-HttpFlashServer::HttpFlashServer(FirmwareUpdater& updater, std::string port)
-    : updater_(updater), port_(std::move(port)) {}
+HttpFlashServer::HttpFlashServer(FirmwareUpdater& updater, TelemetryClient& telemetry,
+                                 std::string port)
+    : updater_(updater), telemetry_(telemetry), port_(std::move(port)) {}
 
 HttpFlashServer::~HttpFlashServer() {
     stop();
@@ -182,6 +214,7 @@ bool HttpFlashServer::start(const std::string& port) {
     listen_fd_ = fd;
     stop_.store(false);
     running_.store(true);
+    start_time_ = std::chrono::steady_clock::now();
     thread_ = std::thread(&HttpFlashServer::threadMain, this);
     return true;
 }
@@ -262,8 +295,31 @@ void HttpFlashServer::threadMain() {
         size_t line_end = buf.find("\r\n");
         std::string request_line = buf.substr(0, line_end);
         std::istringstream iss(request_line);
-        std::string method, path, version;
-        iss >> method >> path >> version;
+        std::string method, raw_path, version;
+        iss >> method >> raw_path >> version;
+
+        // Split query string into path + key/value map.
+        std::string path = raw_path;
+        std::map<std::string, std::string> query;
+        if (size_t q = raw_path.find('?'); q != std::string::npos) {
+            path = raw_path.substr(0, q);
+            std::string qs = raw_path.substr(q + 1);
+            size_t p = 0;
+            while (p <= qs.size()) {
+                size_t amp = qs.find('&', p);
+                std::string pair = qs.substr(p, amp == std::string::npos ? amp : amp - p);
+                size_t eq = pair.find('=');
+                if (eq != std::string::npos) query[pair.substr(0, eq)] = pair.substr(eq + 1);
+                else if (!pair.empty()) query[pair] = "";
+                if (amp == std::string::npos) break;
+                p = amp + 1;
+            }
+        }
+        auto queryUint = [&](const char* key, uint64_t dflt) -> uint64_t {
+            auto it = query.find(key);
+            if (it == query.end() || it->second.empty()) return dflt;
+            try { return std::stoull(it->second); } catch (...) { return dflt; }
+        };
 
         if (method == "GET" && path == "/flash/status") {
             FlashStatus st = updater_.status();
@@ -284,8 +340,74 @@ void HttpFlashServer::threadMain() {
             continue;
         }
 
-        if (method != "POST" || path != "/flash") {
-            sendResponse(client, 405, "{\"error\":\"only POST /flash and GET /flash/status are supported\"}");
+        if (method == "GET" && path == "/api/info") {
+            double uptime = 0.0;
+            if (start_time_.time_since_epoch().count() != 0) {
+                uptime = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - start_time_).count();
+            }
+            std::string resp = std::string()
+                + "{\"app\":\"InverterClientImGui (rte)\""
+                + ",\"device_port\":\"" + jsonEscape(updater_.currentPort()) + "\""
+                + ",\"http_port\":" + std::to_string(actualPort())
+                + ",\"uptime_s\":" + std::to_string(uptime)
+                + ",\"log_dir\":\"" + jsonEscape(log_dir_) + "\""
+                + ",\"endpoints\":["
+                  "\"GET /api/info\""
+                  ",\"GET /api/telemetry\""
+                  ",\"GET /api/console?lines=N&since=SEQ\""
+                  ",\"POST /api/command?wait_ms=N\""
+                  ",\"POST /flash\""
+                  ",\"GET /flash/status\""
+                  "]}";
+            sendResponse(client, 200, resp);
+            CLOSE_SOCKET(client);
+            continue;
+        }
+
+        if (method == "GET" && path == "/api/telemetry") {
+            TelemetryState st = telemetry_.snapshot();
+            double unix_s = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count() / 1000.0;
+            std::string resp = "{\"t\":" + std::to_string(unix_s)
+                + ",\"rx_hz\":" + std::to_string(st.rx_hz)
+                + ",\"suspended\":" + (telemetry_.isSuspended() ? "true" : "false")
+                + ",\"signals\":{";
+            bool first = true;
+            for (const auto& kv : st.latest) {
+                resp += (first ? "\"" : ",\"") + jsonEscape(kv.first)
+                    + "\":" + std::to_string(kv.second);
+                first = false;
+            }
+            resp += "},\"strings\":{";
+            first = true;
+            for (const auto& kv : st.latest_str) {
+                resp += (first ? "\"" : ",\"") + jsonEscape(kv.first)
+                    + "\":\"" + jsonEscape(kv.second) + "\"";
+                first = false;
+            }
+            resp += "}}";
+            sendResponse(client, 200, resp);
+            CLOSE_SOCKET(client);
+            continue;
+        }
+
+        if (method == "GET" && path == "/api/console") {
+            uint64_t since = queryUint("since", 0);
+            uint64_t lines = queryUint("lines", 100);
+            if (lines == 0) lines = 1;
+            if (lines > 1000) lines = 1000;
+            TelemetryState st = telemetry_.snapshot();
+            sendResponse(client, 200, consoleToJson(st, since, (size_t)lines));
+            CLOSE_SOCKET(client);
+            continue;
+        }
+
+        bool is_post_flash = (method == "POST" && path == "/flash");
+        bool is_post_command = (method == "POST" && path == "/api/command");
+        if (!is_post_flash && !is_post_command) {
+            sendResponse(client, 405, "{\"error\":\"supported: GET /flash/status, GET /api/info, "
+                                      "GET /api/telemetry, GET /api/console, POST /api/command, POST /flash\"}");
             CLOSE_SOCKET(client);
             continue;
         }
@@ -337,6 +459,54 @@ void HttpFlashServer::threadMain() {
 
         if (body.size() != content_length) {
             sendResponse(client, 400, "{\"error\":\"short body\"}");
+            CLOSE_SOCKET(client);
+            continue;
+        }
+
+        if (is_post_command) {
+            std::string cmd = extractCommand(body);
+            if (cmd.empty()) {
+                sendResponse(client, 400, "{\"error\":\"empty command\"}");
+                CLOSE_SOCKET(client);
+                continue;
+            }
+            if (telemetry_.isSuspended()) {
+                sendResponse(client, 503, "{\"error\":\"telemetry suspended (firmware update in progress)\"}");
+                CLOSE_SOCKET(client);
+                continue;
+            }
+
+            TelemetryState st = telemetry_.snapshot();
+            uint64_t before = st.console.empty() ? 0 : st.console.back().seq;
+
+            if (!telemetry_.sendLine(cmd)) {
+                sendResponse(client, 503, "{\"error\":\"serial write failed\"}");
+                CLOSE_SOCKET(client);
+                continue;
+            }
+
+            // Collect the response: stop after 250 ms of silence once data
+            // arrives, or when wait_ms elapses (long commands can be
+            // followed up via GET /api/console?since=...).
+            uint64_t wait_ms = queryUint("wait_ms", 2000);
+            if (wait_ms > 30000) wait_ms = 30000;
+            auto deadline = std::chrono::steady_clock::now()
+                + std::chrono::milliseconds(wait_ms);
+            uint64_t seen = before;
+            int quiet_ms = 0;
+            while (std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                st = telemetry_.snapshot();
+                uint64_t latest = st.console.empty() ? 0 : st.console.back().seq;
+                if (latest > seen) {
+                    seen = latest;
+                    quiet_ms = 0;
+                } else if (seen > before) {
+                    quiet_ms += 50;
+                    if (quiet_ms >= 250) break;
+                }
+            }
+            sendResponse(client, 200, consoleToJson(st, before, 500));
             CLOSE_SOCKET(client);
             continue;
         }

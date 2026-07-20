@@ -5,6 +5,14 @@
 #include <deque>
 #include <algorithm>
 #include <unordered_set>
+#include <filesystem>
+
+#ifdef _WIN32
+  #include <windows.h>
+#else
+  #include <limits.h>
+  #include <unistd.h>
+#endif
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -16,6 +24,28 @@
 #include "config_manager.h"
 #include "firmware_updater.h"
 #include "http_server.h"
+#include "telemetry_logger.h"
+
+// Logs live next to the project root (the executable is in build/), so they
+// can be found no matter what directory the app was launched from.
+static std::string resolveLogDir() {
+    namespace fs = std::filesystem;
+#ifdef _WIN32
+    char buf[MAX_PATH];
+    DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+    if (n && n < MAX_PATH) {
+        return (fs::path(buf).parent_path().parent_path() / "logs").string();
+    }
+#else
+    char buf[PATH_MAX];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n > 0) {
+        buf[n] = '\0';
+        return (fs::path(buf).parent_path().parent_path() / "logs").string();
+    }
+#endif
+    return "logs";
+}
 
 // ---------------- Command log only ----------------
 static std::deque<std::string> g_cmdlog;
@@ -84,7 +114,9 @@ static std::string g_cfg_status;
 
 // Firmware update state
 static FirmwareUpdater g_fw_updater;
-static HttpFlashServer g_http_server(g_fw_updater, "18080");
+static TelemetryClient g_client;
+static HttpFlashServer g_http_server(g_fw_updater, g_client, "18080");
+static TelemetryLogger g_telemetry_logger("logs");
 static char g_fw_path[512] = {0};
 static char g_http_port[16] = "18080";
 static bool g_fw_auto_gpio = true;
@@ -215,13 +247,17 @@ int main(int argc, char** argv) {
     std::string port = (argc >= 2) ? argv[1] : "/dev/ttyACM0";
 #endif
 
-    TelemetryClient client;
+    TelemetryClient& client = g_client;
     client.start(port);
     g_fw_updater.setCurrentPort(port);
-    g_fw_updater.setSuspendCallback([&client](bool suspend) {
-        if (suspend) client.suspend();
-        else         client.resume();
+    g_fw_updater.setSuspendCallback([](bool suspend) {
+        if (suspend) g_client.suspend();
+        else         g_client.resume();
     });
+
+    // Mirror console + telemetry to <project>/logs/ for external tools.
+    g_telemetry_logger.setDirectory(resolveLogDir());
+    g_http_server.setLogDir(g_telemetry_logger.directory());
 
     // Auto-start the HTTP firmware-update server on localhost.
     if (!g_http_server.start()) {
@@ -269,6 +305,7 @@ int main(int argc, char** argv) {
         ImGui::NewFrame();
 
         TelemetryState st = client.snapshot();
+        g_telemetry_logger.logFrame(st);
 
         //printf handling
         // Drain telemetry console lines into g_cmdlog using seq numbers (works with culling)

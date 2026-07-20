@@ -41,6 +41,7 @@ add_executable(imgui_api_viewer
   src/config_manager.cpp
   src/firmware_updater.cpp
   src/http_server.cpp
+  src/telemetry_logger.cpp
   ${IMGUI_SOURCES}
   ${IMPLOT_SOURCES}
 )
