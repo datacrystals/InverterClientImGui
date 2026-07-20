@@ -97,7 +97,15 @@ static std::string jsonEscape(const std::string& s) {
             case '\n': out += "\\n"; break;
             case '\r': out += "\\r"; break;
             case '\t': out += "\\t"; break;
-            default: out += c; break;
+            default:
+                if ((unsigned char)c < 0x20) {
+                    char esc[8];
+                    snprintf(esc, sizeof(esc), "\\u%04x", c);
+                    out += esc;
+                } else {
+                    out += c;
+                }
+                break;
         }
     }
     return out;
@@ -257,8 +265,27 @@ void HttpFlashServer::threadMain() {
         std::string method, path, version;
         iss >> method >> path >> version;
 
+        if (method == "GET" && path == "/flash/status") {
+            FlashStatus st = updater_.status();
+            std::string resp = std::string("{\"state\":\"")
+                + FirmwareUpdater::stateString(st.state)
+                + "\",\"busy\":" + (st.busy ? "true" : "false")
+                + ",\"last_error\":\"" + jsonEscape(st.last_error) + "\"";
+            // Include the tail of the updater log for remote debugging.
+            const size_t kLogTail = 30;
+            size_t start = st.log.size() > kLogTail ? st.log.size() - kLogTail : 0;
+            resp += ",\"log\":[";
+            for (size_t i = start; i < st.log.size(); ++i) {
+                resp += (i == start ? "\"" : ",\"") + jsonEscape(st.log[i]) + "\"";
+            }
+            resp += "]}";
+            sendResponse(client, 200, resp);
+            CLOSE_SOCKET(client);
+            continue;
+        }
+
         if (method != "POST" || path != "/flash") {
-            sendResponse(client, 405, "{\"error\":\"only POST /flash is supported\"}");
+            sendResponse(client, 405, "{\"error\":\"only POST /flash and GET /flash/status are supported\"}");
             CLOSE_SOCKET(client);
             continue;
         }

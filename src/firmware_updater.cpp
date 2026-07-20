@@ -165,24 +165,64 @@ bool FirmwareUpdater::findCli(std::string& out_cli) const {
     return false;
 }
 
-bool FirmwareUpdater::findGpioHelper(std::string& out_helper) const {
-    std::error_code ec;
-    fs::path exe_dir;
-
+static fs::path exeDir() {
 #ifdef _WIN32
     char buf[MAX_PATH];
     DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
     if (n && n < MAX_PATH) {
-        exe_dir = fs::path(buf).parent_path();
+        return fs::path(buf).parent_path();
     }
 #else
     char buf[PATH_MAX];
     ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
     if (n > 0) {
         buf[n] = '\0';
-        exe_dir = fs::path(buf).parent_path();
+        return fs::path(buf).parent_path();
     }
 #endif
+    return {};
+}
+
+// Find a python interpreter that has EasyMCP2221 installed. Prefers the
+// project .venv (created with: python3 -m venv .venv && .venv/bin/pip
+// install EasyMCP2221); falls back to plain python3.
+static std::string findPython() {
+    std::error_code ec;
+
+    if (const char* env = std::getenv("RTE_PYTHON")) {
+        if (fs::is_regular_file(env, ec)) return env;
+    }
+
+    fs::path exe_dir = exeDir();
+    std::vector<fs::path> candidates;
+#ifdef _WIN32
+    const char* venv_py[] = {".venv/Scripts/python.exe"};
+#else
+    const char* venv_py[] = {".venv/bin/python"};
+#endif
+    for (const char* rel : venv_py) {
+        if (!exe_dir.empty()) {
+            candidates.push_back(exe_dir / rel);
+            candidates.push_back(exe_dir.parent_path() / rel);
+        }
+        candidates.push_back(fs::current_path(ec) / rel);
+        candidates.push_back(rel);
+    }
+
+    for (const auto& p : candidates) {
+        if (fs::is_regular_file(p, ec)) {
+            // Do NOT canonicalize: a venv python is a symlink to the system
+            // interpreter, and resolving it would drop the venv site-packages.
+            std::string c = fs::absolute(p, ec).string();
+            return c.empty() ? p.string() : c;
+        }
+    }
+    return "python3";
+}
+
+bool FirmwareUpdater::findGpioHelper(std::string& out_helper) const {
+    std::error_code ec;
+    fs::path exe_dir = exeDir();
 
     std::vector<fs::path> candidates;
     if (!exe_dir.empty()) {
@@ -210,7 +250,7 @@ bool FirmwareUpdater::drainSerial(const std::string& port) {
         return false;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    uint8_t junk[256];
+    uint8_t junk[4096];
     int total = 0;
     for (int i = 0; i < 20 && run_.load(); ++i) {
         int n = sp.read(junk, (int)sizeof(junk));
@@ -244,7 +284,8 @@ bool FirmwareUpdater::runCommand(const std::string& cmd, const std::string& desc
 }
 
 bool FirmwareUpdater::gpioCommand(const std::string& helper, const std::string& arg) {
-    std::string cmd = "python3 \"" + helper + "\" " + arg;
+    static const std::string python = findPython();
+    std::string cmd = "\"" + python + "\" \"" + helper + "\" " + arg;
     return runCommand(cmd, std::string("GPIO ") + arg);
 }
 
@@ -326,6 +367,11 @@ void FirmwareUpdater::runJob(const FlashJob& job) {
         logLine("[MANUAL] Waiting 5 seconds for user...");
         std::this_thread::sleep_for(std::chrono::seconds(5));
     }
+
+    // Drain again now that the ROM bootloader is running: the application may
+    // have left kilobytes of telemetry buffered in the USB-UART bridge, which
+    // would otherwise drown the bootloader's sync ACK.
+    drainSerial(job.port);
 
     // 3. Flash + verify.
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
